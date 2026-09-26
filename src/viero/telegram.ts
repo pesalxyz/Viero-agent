@@ -690,7 +690,7 @@ export class TelegramBot {
     if (action === 'settings:auto_size' || action === 'settings:auto_range') {
       const size = action.endsWith('size');
       await this.options.repo.setControls({ ...controls, ...(size ? { sizeMode: 'AUTO' as const } : { rangeMode: 'AUTO' as const }) });
-      await this.send(chatId, `${size ? 'Auto Size' : 'Auto Range'} selected. AUTO strategy logic will be implemented in Phase 3.`);
+      await this.send(chatId, `${size ? 'Auto Size' : 'Auto Range'} selected. Deterministic market-cap/volatility rules will apply on the next candidate.`);
       return;
     }
     if (action === 'settings:fixed_size' || action === 'settings:fixed_range') {
