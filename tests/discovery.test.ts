@@ -129,6 +129,40 @@ test('Robinhood stock registry outage fails closed before security screening', a
   assert.equal(securityCalls, 0);
 });
 
+test('BNB applies the same discovery economics as Robinhood before token screening', async () => {
+  const lowVolume = '0xdddddddddddddddddddddddddddddddddddddddd' as Address;
+  const accepted = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' as Address;
+  let securityCalls = 0;
+  let acceptedVolume = 125_000;
+  const gmgn = {
+    async query(_chain: ChainId, command: string): Promise<unknown> {
+      if (command !== 'hotsearch') return {};
+      return { rank: [
+        { address: lowVolume, symbol: 'LOW', rank: 1, market_cap: 2_000_000, volume: 99_999, liquidity: 100_000, creation_timestamp: 1 },
+        { address: accepted, symbol: 'OK', rank: 2, market_cap: 2_000_000, volume: acceptedVolume, liquidity: 100_000, creation_timestamp: 1 },
+      ] };
+    },
+    async security() { securityCalls++; return { is_honeypot: false, sell_tax: 0, top_10_holder_rate: 0.1, is_open_source: true, flags: [], privileges: [] }; },
+  } as unknown as Gmgn;
+  const discovery = new TokenDiscovery(makeFakeClients() as never, gmgn, [56], {
+    screenerPolicy: makePolicy(), gmgnOnly: true, hotSearchLimit: 10,
+  });
+  const result = await discovery.fetchAndScreenOnce(56);
+  assert.equal(result.economicFiltered, 1);
+  assert.equal(result.economicFilterDetails[0]?.address, lowVolume);
+  assert.deepEqual(result.economicFilterDetails[0]?.reasons, ['VOLUME_1H_TOO_LOW']);
+  assert.equal(result.screened, 1);
+  assert.equal(securityCalls, 1);
+  assert.deepEqual([...discovery.entries()].map(entry => entry.address), [accepted]);
+
+  // A previously passing token must not remain rankable after its next
+  // Hot Search observation falls below the shared economic floor.
+  acceptedVolume = 99_999;
+  const next = await discovery.fetchAndScreenOnce(56);
+  assert.equal(next.economicFiltered, 2);
+  assert.equal(discovery.passed(56).length, 0);
+});
+
 test('bundled blocked-token seed persists and uses address-only matching', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'viero-blocked-'));
   const store = new BlockedTokenStore(join(dir, 'blocked.json'));

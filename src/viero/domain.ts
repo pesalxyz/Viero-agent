@@ -84,6 +84,11 @@ export const observationSchema = z.object({
   positionsCreated: nonnegative.nullable(), uniqueLps: nonnegative.nullable(),
   liquidityAddedUsd: nonnegative.nullable(), liquidityRemovedUsd: nonnegative.nullable(),
   estimatedLifecycleCostUsd: nonnegative.nullable(),
+  // Attached only to read-only active-position observations when the
+  // position-manager call already fetched the NFT's actual liquidity. It is
+  // deliberately optional so historical/candidate observations remain
+  // backward-compatible.
+  positionLiquidity: uintSchema.optional(),
   issues: z.array(z.string()).default([]),
 });
 export type Observation = z.infer<typeof observationSchema>;

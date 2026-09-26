@@ -31,12 +31,15 @@ export function formatOpenPositionMessage(input: PositionMessageInput): string {
 }
 
 export function formatClosePositionMessage(input: CloseMessageInput): string {
-  const id = input.tokenId.toString(), protocol = input.protocol.toUpperCase();
-  const range = rangeText(input.lowerPrice, input.upperPrice);
-  const pnl = input.pnlPct == null ? 'unavailable' : `${input.pnlPct >= 0 ? '+' : ''}${num(input.pnlPct)}% (~$${num(input.pnlUsd)})`;
-  const lines = [`✅ Closed ${input.symbol} #${id} [${protocol}]`, `Reason: ${input.reason}`, `Range: ${range}`, `Entry: ${num(input.entryPrice)}`, `Exit: ${num(input.exitPrice)} ${input.baseSymbol ?? 'base'}/${input.quoteSymbol ?? 'quote'}`, `Deposited: ~${num(input.quoteAmount)} ${input.quoteSymbol ?? 'quote'} ($${num(input.depositUsd)})`, `Closed value: ~$${num(input.currentValueUsd)}`, `PnL: ${pnl}`, `Close:`, link(input.blockExplorerTxBase, input.txHash ?? ''), `Position:`, link(input.positionBase, id)];
+  const id = input.tokenId.toString(), reason = input.reason === 'MANUAL' ? 'MANUAL CLOSE' : input.reason;
+  const lines = ['✅ Position Closed', `${input.symbol} #${id} [${input.protocol}]`, `Reason: ${reason}`];
+  if (input.pnlPct != null && Number.isFinite(input.pnlPct)) lines.push(`Final PnL: ${input.pnlPct >= 0 ? '+' : ''}${input.pnlPct.toFixed(4)}%`);
+  if (input.txHash) lines.push(`Tx: ${input.txHash.slice(0, 6)}…${input.txHash.slice(-4)}`);
   if (input.normalization && 'pending' in input.normalization) lines.push('⚠️ Post-close normalization pending');
-  else if (input.normalization) { lines.push(`Normalized to: ${input.normalization.amount ?? 'unavailable'} ${input.normalization.symbol ?? input.quoteSymbol ?? 'quote'}`, 'Swap:', link(input.blockExplorerTxBase, input.normalization.txHash ?? '')); }
+  else if (input.normalization) {
+    lines.push(`Normalized to: ${input.normalization.amount ?? 'unavailable'} ${input.normalization.symbol ?? input.quoteSymbol ?? 'quote'}`);
+    if (input.normalization.txHash) lines.push(`Swap Tx: ${input.normalization.txHash.slice(0, 6)}…${input.normalization.txHash.slice(-4)}`);
+  }
   return lines.join('\n');
 }
 

@@ -23,7 +23,7 @@ import {
   historicalRejections,
   recordClosedOutcome,
 } from '../src/viero/execution/history.js';
-import { liveManagementDecision, managementPrincipalPnlPct, normalizeHumanRange } from '../src/viero/management/live.js';
+import { liveManagementDecision, managementPrincipalPnlPct, managementPrincipalValue, normalizeHumanRange } from '../src/viero/management/live.js';
 import { effectivePnlDepositUsd, isPrimaryStableQuoteOnly, pnlPctFromValues } from '../src/viero/management/pnl.js';
 import { screen } from '../src/viero/screening/pipeline.js';
 import { DEFAULT_POLICY } from '../src/viero/config/policy.js';
@@ -355,6 +355,21 @@ test('post-mint entry principal overrides the transfer budget for every PnL cons
   assert.equal(baseline, 9.803367);
   assert.ok(Math.abs(pnlPctFromValues(9.803367 + 0.000351908, baseline)! - 0.00358966) < 1e-7);
   assert.ok(Math.abs(pnlPctFromValues(9.803367, baseline)!) < 1e-12);
+});
+
+test('management PnL reuses actual V3 NFT liquidity already fetched for fee accounting', () => {
+  const observation = demoObservations()[0]!;
+  const position = makeLivePosition({ entryPrincipalUsd: null });
+  const planned = managementPrincipalValue(position, observation, DEFAULT_POLICY, observation.state.observedAt)!;
+  const actualLiquidity = position.plan.liquidity * 2n;
+  const enrichedObservation = { ...observation, positionLiquidity: actualLiquidity };
+  const actual = managementPrincipalValue(position, enrichedObservation, DEFAULT_POLICY, observation.state.observedAt)!;
+  assert.ok(actual.valueUsd > planned.valueUsd);
+  // Integer sqrt/liquidity deltas round independently, so assert a clear
+  // liquidity-driven increase without relying on an exact floating ratio.
+  assert.ok(actual.valueUsd > planned.valueUsd * 1.5);
+  assert.ok(Math.abs(managementPrincipalPnlPct(position, enrichedObservation, DEFAULT_POLICY, observation.state.observedAt)! -
+    pnlPctFromValues(actual.valueUsd, position.plan.depositUsd)!) < 1e-12);
 });
 
 test('close notification uses canonical fee-inclusive management PnL instead of a mismatched receipt fallback', () => {

@@ -94,6 +94,13 @@ export class Agent {
   readonly tokenMemory = new TokenMemoryStore();
   readonly blockedTokens = new BlockedTokenStore();
   private readonly discoverySnapshots = new Map<ChainId, Awaited<ReturnType<TokenDiscovery['fetchAndScreenOnce']>>>();
+  /**
+   * The read-only position observations produced while building the most
+   * recent cycle report. Live mode consumes these as the first management
+   * observation so the displayed PnL and the rule evaluation cannot diverge.
+   * A close still requires a fresh independent confirmation below.
+   */
+  private readonly cyclePositionObservations = new Map<string, Observation>();
   readonly supervisor: ChainSupervisor;
   private checkedDeployments = new Set<ChainId>();
   constructor(readonly policy: Policy, readonly repository: Repository, readonly model?: DecisionModel, readonly signer?: SignerClient,
@@ -172,6 +179,7 @@ export class Agent {
 
   async cycle(options: { mode: Mode; observations?: Observation[]; now?: number; chains?: ChainId[]; seeds?: PoolRef[]; tokenLimit?: number; poolLimit?: number; scanFrom?: bigint; persist?: boolean }): Promise<AgentRun> {
     const now = options.now ?? Date.now() / 1000;
+    this.cyclePositionObservations.clear();
     const run: AgentRun = { id: randomUUID(), mode: options.mode, startedAt: now, finishedAt: now,
       configVersion: POLICY_VERSION, deploymentVersion: DEPLOYMENT_VERSION, policy: this.policy,
       observations: [], candidates: [], discoveries: [], decisions: [], tokenDecisions: [], positions: [], health: [], providerObservations: [], errors: [], status: 'ok' };
@@ -339,6 +347,7 @@ export class Agent {
       .map(async position => {
         try {
           const enriched: any = position.pool.protocol === 'v4' ? await this.enrichV4Position(position) : await this.enrichV3Position(position);
+          this.cyclePositionObservations.set(position.id, enriched.observation as Observation);
           const feeUsd = enriched.feeUsd ?? null;
           const pnlBase = feeUsd != null && enriched.valueUsd != null ? enriched.valueUsd + feeUsd : enriched.valueUsd;
           const pnlDepositUsd = effectivePnlDepositUsd({ persistedDepositUsd: position.plan.depositUsd, entryPrincipalUsd: position.entryPrincipalUsd, principalValueUsd: enriched.valueUsd ?? null,
@@ -675,7 +684,7 @@ export class Agent {
       const fees = v3UnclaimedFees({ tokensOwed0: BigInt(raw[10] as bigint), tokensOwed1: BigInt(raw[11] as bigint), feeGrowthInside0Now: inside0, feeGrowthInside1Now: inside1, feeGrowthInside0Last: BigInt(raw[8] as bigint), feeGrowthInside1Last: BigInt(raw[9] as bigint), liquidity });
       const prices = [observation.state.token0, observation.state.token1].map(t => canonicalPrice(observation.prices, t.address, Date.now() / 1000, this.policy)?.usd ?? null);
       const feeUsd = prices[0] == null || prices[1] == null ? null : tokenValue(fees.fee0Raw, observation.state.token0.decimals, prices[0]) + tokenValue(fees.fee1Raw, observation.state.token1.decimals, prices[1]);
-      return Object.assign(observation, { fee0Raw: fees.fee0Raw, fee1Raw: fees.fee1Raw, fee0Human: formatUnits(fees.fee0Raw, observation.state.token0.decimals), fee1Human: formatUnits(fees.fee1Raw, observation.state.token1.decimals), feeUsd, feeEvidence: feeUsd !== null });
+      return Object.assign(observation, { positionLiquidity: liquidity, fee0Raw: fees.fee0Raw, fee1Raw: fees.fee1Raw, fee0Human: formatUnits(fees.fee0Raw, observation.state.token0.decimals), fee1Human: formatUnits(fees.fee1Raw, observation.state.token1.decimals), feeUsd, feeEvidence: feeUsd !== null });
     } catch { return Object.assign(observation, { feeEvidence: false, fee0Raw: null, fee1Raw: null, feeUsd: null }); }
   }
   private async observePositionLightweight(position: import('../execution/liveState.js').LivePosition) {
@@ -854,7 +863,14 @@ export class Agent {
       }
       if (position.status !== 'open') continue;
       try {
-        let observation = await this.observeManagementPosition(position, now);
+        // When live mode has just rendered a cycle, evaluate the exact same
+        // enriched snapshot first. This makes a displayed TP/SL PnL actionable
+        // in that five-minute cycle instead of waiting for the next interval.
+        // The confirmation path below always performs an independent fresh
+        // observation before any signer handoff.
+        const cycleObservation = this.cyclePositionObservations.get(position.id);
+        this.cyclePositionObservations.delete(position.id);
+        let observation = cycleObservation ?? await this.observeManagementPosition(position, now);
         // PnL evidence can be absent from an otherwise valid lightweight
         // snapshot when one canonical price read is transiently unavailable.
         // Retry the complete read twice before evaluating rules; if evidence
@@ -983,8 +999,20 @@ export class Agent {
     }
     let current = position;
     let transactions = [] as Awaited<ReturnType<SignerClient['close']>>['transactions'];
+    let closePnlPct: number | null = null;
+    let closeSymbol: string | undefined;
     if (current.status === 'open') {
       const observation = await this.observePoolLightweight(current.pool);
+      const chain = getChain(current.chainId);
+      const quoteAddresses = [chain.primaryStable, chain.wrappedNative].filter(Boolean).map(address => address!.toLowerCase());
+      const baseToken = [observation.state.token0, observation.state.token1].find(token => !quoteAddresses.includes(token.address.toLowerCase()));
+      closeSymbol = baseToken?.symbol;
+      try {
+        const enriched = current.pool.protocol === 'v4' ? await this.enrichV4Position(current) : await this.enrichV3Position(current);
+        closePnlPct = closeNotificationPnlPct(current, enriched.observation, this.policy, Date.now() / 1000, null, 'MANUAL');
+      } catch {
+        closePnlPct = null;
+      }
       const preWriteControls = await this.repository.controls();
       if ((preWriteControls.botState ?? 'STOPPED') !== 'RUNNING') throw new Error('BOT_STOPPED_WRITE_DISABLED');
       await this.signer.health();
@@ -996,7 +1024,7 @@ export class Agent {
       state.transactions.push(...executed.transactions);
       await this.repository.setStrategyState(state);
     }
-    if (action === 'close') return { position: current, transactions, normalized: false };
+    if (action === 'close') return { position: current, transactions, normalized: false, pnlPct: closePnlPct, symbol: closeSymbol };
     const preNormalizeControls = await this.repository.controls();
     if ((preNormalizeControls.botState ?? 'STOPPED') !== 'RUNNING') throw new Error('BOT_STOPPED_WRITE_DISABLED');
     try {
@@ -1005,13 +1033,13 @@ export class Agent {
       state.transactions.push(...normalized.transactions);
       state.transactions = state.transactions.slice(-5000);
       await this.repository.setStrategyState(state);
-      return { position: normalized.value, transactions: [...transactions, ...normalized.transactions], normalized: true };
+      return { position: normalized.value, transactions: [...transactions, ...normalized.transactions], normalized: true, pnlPct: closePnlPct, symbol: closeSymbol };
     } catch (error) {
       const failed = { ...current, normalization: { ...current.normalization, status: 'failed' as const, attempts: current.normalization.attempts + 1, lastError: errorMessage(error) }, updatedAt: Date.now() / 1000 };
       state.positions[index] = failed;
       state.transactions = state.transactions.slice(-5000);
       await this.repository.setStrategyState(state);
-      return { position: failed, transactions, normalized: false, normalizationError: errorMessage(error) };
+      return { position: failed, transactions, normalized: false, normalizationError: errorMessage(error), pnlPct: closePnlPct, symbol: closeSymbol };
     }
   }
   async replay(windows: Observation[][]) {

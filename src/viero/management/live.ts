@@ -32,8 +32,12 @@ export function managementPrincipalValue(
   const price1 = canonicalPrice(observation.prices, state.token1.address, now, policy);
   const lower = sqrtAtTick(position.plan.tickLower), upper = sqrtAtTick(position.plan.tickUpper);
   const current = state.sqrtPriceX96 < lower ? lower : state.sqrtPriceX96 > upper ? upper : state.sqrtPriceX96;
-  const amount0 = amount0Delta(current, upper, position.plan.liquidity);
-  const amount1 = amount1Delta(lower, current, position.plan.liquidity);
+  // V3 fee accounting already reads positions(tokenId), which returns the
+  // actual minted NFT liquidity. Reuse it when present; the planned liquidity
+  // is only a compatibility fallback for older/synthetic observations.
+  const liquidity = observation.positionLiquidity ?? position.plan.liquidity;
+  const amount0 = amount0Delta(current, upper, liquidity);
+  const amount1 = amount1Delta(lower, current, liquidity);
   if ((amount0 > 0n && !price0) || (amount1 > 0n && !price1)) return null;
   const valueUsd = tokenValue(amount0, state.token0.decimals, price0?.usd ?? 0)
     + tokenValue(amount1, state.token1.decimals, price1?.usd ?? 0);

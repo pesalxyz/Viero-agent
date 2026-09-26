@@ -75,6 +75,20 @@ install -o root -g root -m 0644 "$target/deploy/viero-indexer.service" /etc/syst
 install -o root -g root -m 0644 "$target/deploy/viero-telegram.service" /etc/systemd/system/viero-telegram.service
 install -o root -g root -m 0644 "$target/deploy/viero-signer.service" /etc/systemd/system/viero-signer.service
 
+# Older deployments used local drop-ins that pinned the agent to Robinhood.
+# They are not part of the release and must not override the operator's
+# persisted chain selection. Preserve them outside systemd for auditability,
+# rather than deleting them, so a future install cannot reactivate the pin.
+legacy_dropin_dir=/etc/viero/disabled-dropins
+install -d -o root -g root -m 0700 "$legacy_dropin_dir"
+for legacy_dropin in \
+  /etc/systemd/system/viero-agent.service.d/live-robinhood.conf \
+  /etc/systemd/system/viero-agent.service.d/zz-live-robinhood.conf; do
+  if [[ -e "$legacy_dropin" || -L "$legacy_dropin" ]]; then
+    mv -f "$legacy_dropin" "$legacy_dropin_dir/$(basename "$legacy_dropin").disabled.$release_id"
+  fi
+done
+
 if [[ -L /opt/viero/current ]]; then
   ln -sfn "$(readlink -f /opt/viero/current)" /opt/viero/previous
 fi

@@ -9,15 +9,11 @@ import { WalletClients } from './walletClients.js';
 import { PublicClients } from '../clients/publicClients.js';
 import { randomUUID } from 'node:crypto';
 
-/**
- * Relay's SDK keeps a local chain registry for execution.  Robinhood Chain is
- * not one of the SDK's built-in fallback chains, so it must be registered with
- * the same RPC and explorer metadata that Viero uses everywhere else.
- */
-export function robinhoodRelayChain(env: NodeJS.ProcessEnv = process.env): RelayChain {
-  const chain = getChain(4663);
-  const rpcUrls = (env.VIERO_RPC_4663 ?? '').split(',').map(url => url.trim()).filter(Boolean);
-  if (rpcUrls.length === 0) throw new Error('NO_RPC_ENDPOINTS: 4663');
+/** Register a Viero chain in Relay's local SDK registry. */
+function vieroRelayChain(chainId: 4663 | 56, env: NodeJS.ProcessEnv): RelayChain {
+  const chain = getChain(chainId);
+  const rpcUrls = (env[`VIERO_RPC_${chainId}`] ?? '').split(',').map(url => url.trim()).filter(Boolean);
+  if (rpcUrls.length === 0) throw new Error(`NO_RPC_ENDPOINTS: ${chainId}`);
   const viemChain = defineChain({
     id: chain.id,
     name: chain.name,
@@ -32,8 +28,21 @@ export function robinhoodRelayChain(env: NodeJS.ProcessEnv = process.env): Relay
   return convertViemChainToRelayChain(viemChain);
 }
 
+export function robinhoodRelayChain(env: NodeJS.ProcessEnv = process.env): RelayChain {
+  return vieroRelayChain(4663, env);
+}
+
+export function bnbRelayChain(env: NodeJS.ProcessEnv = process.env): RelayChain {
+  return vieroRelayChain(56, env);
+}
+
 export function relayChains(env: NodeJS.ProcessEnv = process.env): RelayChain[] {
-  return [convertViemChainToRelayChain(mainnet), robinhoodRelayChain(env)];
+  const chains = [convertViemChainToRelayChain(mainnet), robinhoodRelayChain(env)];
+  // BNB is optional for hosts that only run Robinhood. When its configured
+  // RPC is present, register it with the same metadata used by Viero's public
+  // clients so post-close normalization can resolve chain 56 locally.
+  if ((env.VIERO_RPC_56 ?? '').split(',').some(url => url.trim())) chains.push(bnbRelayChain(env));
+  return chains;
 }
 
 export class RelayBalancer {

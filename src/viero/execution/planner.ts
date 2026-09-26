@@ -1,6 +1,6 @@
 import { parseUnits, type Address } from 'viem';
 import { getChain } from '../config/chains.js';
-import { CHAIN_LIMITS, type Policy } from '../config/policy.js';
+import { CHAIN_LIMITS, type Policy, usesSingleSidedQuoteExecution } from '../config/policy.js';
 import { type ChainId, type Observation, type PoolRef, poolIdentity } from '../domain.js';
 import { canonicalPrice, type Candidate } from '../screening/pipeline.js';
 import { amount0Delta, amount1Delta, humanQuotePriceFromSqrt, sqrtAtTick, tickAtHumanQuotePrice, tokenValue } from '../screening/math.js';
@@ -35,7 +35,7 @@ export class InsufficientQuoteBalanceError extends Error {
   }
 }
 export function refreshFixedRangePlan(plan: PositionPlan, state: Observation['state'], prices?: Observation['prices'], policy?: Policy): PositionPlan {
-  if (state.pool.chainId !== 4663) return plan;
+  if (!usesSingleSidedQuoteExecution(state.pool.chainId)) return plan;
   const quote = quoteAssetForPool(state), stableIs0 = quote.isToken0, stableIs1 = !quote.isToken0;
   // Preserve the operator-selected fixed-size quote deposit when the final
   // execution read observes a moved price/range. Reusing the old liquidity
@@ -98,7 +98,7 @@ export function planPosition(observation: Observation, candidate: Candidate, bud
   if (portfolio.totalExposureUsd + budgetUsd > policy.maximumExposureUsd || (portfolio.chainExposureUsd[id] ?? 0) + budgetUsd > CHAIN_LIMITS[id].maximumExposureUsd) throw new Error('EXPOSURE_LIMIT');
   const snapshotNow = Math.max(observation.state.observedAt, observation.state.fetchedAt, observation.windowEnd, ...observation.prices.map(p => Math.max(p.observedAt, p.fetchedAt)));
   let tickLower: number, tickUpper: number;
-  if (settings && id === 4663) {
+  if (settings && usesSingleSidedQuoteExecution(id)) {
     const quote = quoteAssetForPool(s), stableIs0 = quote.isToken0, stableIs1 = !quote.isToken0;
     const meme = stableIs0 ? s.token1 : s.token0;
     const memePrice = canonicalPrice(observation.prices, meme.address, snapshotNow, policy)?.usd;
@@ -123,7 +123,7 @@ export function planPosition(observation: Observation, candidate: Candidate, bud
     tickLower = Math.floor((s.tick - lowerWidth) / s.tickSpacing) * s.tickSpacing;
     tickUpper = Math.ceil((s.tick + upperWidth) / s.tickSpacing) * s.tickSpacing;
   }
-  const configuredWidthLimit = settings?.rangeMode === 'AUTO' && id === 4663
+  const configuredWidthLimit = settings?.rangeMode === 'AUTO' && usesSingleSidedQuoteExecution(id)
     ? Math.max(policy.maximumRangeWidthTicks, Math.ceil(Math.abs(Math.log(1 - resolved.rangePct / 100) / Math.log(1.0001))) + s.tickSpacing * 2)
     : policy.maximumRangeWidthTicks;
   if (tickLower < -887272 || tickUpper > 887272 || tickUpper - tickLower > configuredWidthLimit || tickLower >= tickUpper) throw new Error('RANGE_LIMIT');
@@ -138,7 +138,7 @@ export function planPosition(observation: Observation, candidate: Candidate, bud
   // that liquidity after a price move: that can turn a $10 quote deposit into
   // a materially smaller mint.
   let liquidity: bigint;
-  if (settings && id === 4663) {
+  if (settings && usesSingleSidedQuoteExecution(id)) {
     const quote = quoteAssetForPool(s);
     const quoteToken = quote.isToken0 ? s.token0 : s.token1;
     const quotePrice = quote.isToken0 ? p0 : p1;
@@ -156,7 +156,7 @@ export function planPosition(observation: Observation, candidate: Candidate, bud
     { token: s.token1.address, amount: amount1Delta(lower, s.sqrtPriceX96, liquidity) },
   ];
   let depositAssets = assets();
-  if (settings && id === 4663) {
+  if (settings && usesSingleSidedQuoteExecution(id)) {
     const quote = quoteAssetForPool(s), stable = quote.address.toLowerCase(), stableIs0 = quote.isToken0;
     // Outside-range math is directional: mint only the quote asset and
     // explicitly zero the opposite side (no pre-mint swap).

@@ -19,7 +19,8 @@ export const policySchema = z.object({
   minimumVolumeUsd: z.number().finite().nonnegative().default(10000),
   minimumUniqueTraders: z.number().int().positive().default(20),
   maximumHolderPct: z.number().finite().min(0).max(100).default(40),
-  maximumSellTaxBps: z.number().int().nonnegative().default(0),
+  // Permit sell tax up to and including 300 bps (3%).
+  maximumSellTaxBps: z.number().int().nonnegative().default(300),
   minimumExpectedNetFeesUsd: z.number().finite().nonnegative().default(0),
   maximumSlippageBps: z.number().int().min(0).max(500).default(50),
   maximumRangeWidthTicks: z.number().int().min(2).max(1774544).default(10000),
@@ -48,7 +49,25 @@ export type Policy = z.infer<typeof policySchema>;
 export const DEFAULT_POLICY = policySchema.parse({});
 export const CHAIN_LIMITS: Record<ChainId, { maximumExposureUsd: number; minimumTvlUsd: number; minimumDepthUsd: number; minimumDepthDownUsd?: number; minimumDepthUpUsd?: number }> = {
   4663: { maximumExposureUsd: 100, minimumTvlUsd: 50000, minimumDepthUsd: 100, minimumDepthDownUsd: 50, minimumDepthUpUsd: 50 },
-  56: { maximumExposureUsd: 150, minimumTvlUsd: 75000, minimumDepthUsd: 20000 },
+  // BNB uses the same candidate execution policy as Robinhood.  Chain
+  // identity, quote assets, and protocol deployments remain BNB-specific;
+  // only the execution gates are shared.
+  56: { maximumExposureUsd: 100, minimumTvlUsd: 50000, minimumDepthUsd: 100, minimumDepthDownUsd: 50, minimumDepthUpUsd: 50 },
   8453: { maximumExposureUsd: 150, minimumTvlUsd: 75000, minimumDepthUsd: 20000 },
   5042: { maximumExposureUsd: 100, minimumTvlUsd: 50000, minimumDepthUsd: 10000 },
 };
+
+/** Robinhood-style execution skips router simulation evidence because the
+ * final signer simulation remains authoritative. */
+export function usesRobinhoodExecutionRules(chainId: ChainId): boolean {
+  return chainId === 4663 || chainId === 56;
+}
+
+/**
+ * Chains whose configured execution policy opens a quote-only position on a
+ * range placed entirely on the quote side of the current price.  Robinhood
+ * was the original implementation; BNB uses the same execution semantics.
+ */
+export function usesSingleSidedQuoteExecution(chainId: ChainId): boolean {
+  return chainId === 4663 || chainId === 56;
+}

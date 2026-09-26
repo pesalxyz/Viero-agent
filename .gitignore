@@ -52,7 +52,7 @@ credentials/
 
 # Viero runtime state and databases
 data/
-runtime/
+/runtime/
 state/
 *.db
 *.db-*

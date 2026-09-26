@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { zeroAddress } from 'viem';
 import { CHAIN_IDS, CHAINS, getChain, sourceSlug } from '../src/viero/config/chains.js';
-import { CHAIN_LIMITS, DEFAULT_POLICY as policy } from '../src/viero/config/policy.js';
+import { CHAIN_LIMITS, DEFAULT_POLICY as policy, usesRobinhoodExecutionRules, usesSingleSidedQuoteExecution } from '../src/viero/config/policy.js';
 import { poolIdentity, poolId, poolSchema, sanitizeMetadata } from '../src/viero/domain.js';
 import { demoObservations, DEMO_TIME as now } from '../src/viero/fixtures/demo.js';
 import { canonicalPrice, screen, rank, spotPriceDeviationPct } from '../src/viero/screening/pipeline.js';
@@ -21,6 +21,17 @@ test('Robinhood depth policy uses the reduced production thresholds', () => {
   assert.equal(CHAIN_LIMITS[4663].minimumDepthDownUsd, 50);
   assert.equal(CHAIN_LIMITS[4663].minimumDepthUpUsd, 50);
   assert.equal(CHAIN_LIMITS[4663].minimumDepthUsd, 100);
+});
+test('BNB candidate execution uses the Robinhood execution gates', () => {
+  assert.deepEqual(CHAIN_LIMITS[56], CHAIN_LIMITS[4663]);
+  assert.equal(usesRobinhoodExecutionRules(4663), true);
+  assert.equal(usesRobinhoodExecutionRules(56), true);
+  assert.equal(usesRobinhoodExecutionRules(8453), false);
+  assert.equal(usesRobinhoodExecutionRules(5042), false);
+  assert.equal(usesSingleSidedQuoteExecution(4663), true);
+  assert.equal(usesSingleSidedQuoteExecution(56), true);
+  assert.equal(usesSingleSidedQuoteExecution(8453), false);
+  assert.equal(usesSingleSidedQuoteExecution(5042), false);
 });
 test('spot divergence uses asymmetric signed boundaries', () => {
   const close = (actual: number, expected: number) => assert.ok(Math.abs(actual - expected) < 1e-9);
@@ -81,7 +92,7 @@ const rejectionCases: Array<[string, (o: ReturnType<typeof fixture>) => void, st
   ['sell failure on Robinhood is deferred to executor', o => { o.risks[0]!.sellSimulation = false; }, null],
   ['unknown risk is not false', o => { o.risks[0]!.honeypot = null; }, 'HONEYPOT'],
   ['large holders', o => { o.risks[0]!.top10HolderPct = 90; }, 'HOLDER_CONCENTRATION'],
-  ['tax', o => { o.risks[0]!.sellTaxBps = 100; }, 'SELL_TAX'],
+  ['tax', o => { o.risks[0]!.sellTaxBps = 400; }, 'SELL_TAX'],
   ['partial window', o => { o.complete = false; }, 'INCOMPLETE_WINDOW'],
   ['indexer lag', o => { o.indexedBlock -= 100n; }, 'INDEXER_LAG'],
   ['missing depth', o => { o.ticksComplete = false; }, 'DEPTH_UNAVAILABLE'],

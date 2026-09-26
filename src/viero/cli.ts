@@ -21,6 +21,7 @@ import { CandidateAnalyst } from './agent/analyst.js';
 import { createLlmClient } from './agent/llmClient.js';
 import { ConversationalHandler } from './telegram/conversational.js';
 import { SignerClient } from './execution/signerClient.js';
+import { selectedRuntimeChains } from './runtime/chainSelection.js';
 
 try { process.loadEnvFile?.(); } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e; }
 const HELP = `Viero LP Agent (read-only and paper)
@@ -116,18 +117,29 @@ async function main() {
       const cycles = values.cycles ? z.coerce.number().int().min(1).parse(values.cycles) : Infinity;
       const abort = new AbortController(), stop = () => abort.abort();
       process.once('SIGINT', stop); process.once('SIGTERM', stop);
-      let screened = 0, nextScreen = 0, nextManagement = 0;
+        let screened = 0, nextScreen = 0, nextManagement = 0;
       try {
         while (!abort.signal.aborted && screened < cycles) {
           const now = Date.now() / 1000;
-          if (now >= nextManagement) {
-            await output({ type: 'management', at: now, results: await agent.manageLive(now) });
-            nextManagement = now + policy.managementIntervalSeconds;
-          }
           if (now >= nextScreen) {
-            const report = await agent.cycle({ mode: 'live-execution', chains: selected, seeds, tokenLimit, poolLimit, scanFrom });
+            // Chain selection is operator-controlled state and may change
+            // while the long-running service remains up.  Re-read it at the
+            // same boundary as the screening cycle so Telegram chain toggles
+            // cannot leave the agent screening one chain and attempting
+            // execution on another.
+            const controls = await repo.controls();
+            const routineChains = selectedRuntimeChains(selected, controls.enabledChains);
+            const report = await agent.cycle({ mode: 'live-execution', chains: routineChains, seeds, tokenLimit, poolLimit, scanFrom });
             await output(report, renderReport(report)); screened++;
             nextScreen = Date.now() / 1000 + policy.screeningIntervalSeconds;
+          }
+          // Evaluate management immediately after the cycle snapshot. Agent
+          // reuses the exact enriched position observation rendered above for
+          // its first decision, then performs the mandatory fresh confirmation
+          // before any close/claim handoff.
+          if (now >= nextManagement || nextManagement === 0) {
+            await output({ type: 'management', at: Date.now() / 1000, results: await agent.manageLive(Date.now() / 1000) });
+            nextManagement = Date.now() / 1000 + policy.managementIntervalSeconds;
           }
           if (screened >= cycles) break;
           const waitSeconds = Math.max(1, Math.min(nextScreen, nextManagement) - Date.now() / 1000);

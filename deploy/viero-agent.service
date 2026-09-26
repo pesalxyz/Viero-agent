@@ -17,6 +17,7 @@ WorkingDirectory=/opt/viero/current
 Environment=NODE_ENV=production
 Environment=HOME=/var/lib/viero
 EnvironmentFile=/etc/viero/viero.env
+Environment=VIERO_MODE=live
 ExecStartPre=/opt/viero/current/deploy/run-agent.sh preflight
 ExecStart=/opt/viero/current/deploy/run-agent.sh
 Restart=on-failure

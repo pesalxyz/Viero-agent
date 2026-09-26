@@ -1,6 +1,6 @@
 import { zeroAddress } from 'viem';
 import { getChain } from '../config/chains.js';
-import { CHAIN_LIMITS, POLICY_VERSION, type Policy } from '../config/policy.js';
+import { CHAIN_LIMITS, POLICY_VERSION, type Policy, usesRobinhoodExecutionRules } from '../config/policy.js';
 import { observationSchema, poolId, poolIdentity, type Observation, type Price, type PoolRef } from '../domain.js';
 import { depth1Pct, volatility, spotPrice, sqrtAtTick } from './math.js';
 
@@ -196,7 +196,7 @@ export function screen(input: Observation, policy: Policy, now: number, options:
     // Robinhood smoke-test execution does not yet have a router simulation.
     // ERC20 transfer probes are informational only; the planner/executor's
     // final transaction simulation remains mandatory before any broadcast.
-    if (pool.chainId !== 4663) reject(risk.buySimulation !== true || risk.sellSimulation !== true, 'SIMULATION_REQUIRED', `${token.address}: successful buy and sell simulations required`);
+    if (!usesRobinhoodExecutionRules(pool.chainId)) reject(risk.buySimulation !== true || risk.sellSimulation !== true, 'SIMULATION_REQUIRED', `${token.address}: successful buy and sell simulations required`);
   }
   const ageBand = o.poolCreatedAt !== null && now - o.poolCreatedAt < 7 * 86400 ? 'new' : 'established';
   const quoteClass = [s.token0.address, s.token1.address].includes(chain.primaryStable) ? 'stable' : 'native';

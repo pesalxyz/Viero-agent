@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createClient, MAINNET_RELAY_API } from '@relayprotocol/relay-sdk';
 import { keccak256, toHex } from 'viem';
-import { relayChains, RelayBalancer } from '../src/viero/execution/relay.js';
+import { bnbRelayChain, relayChains, RelayBalancer } from '../src/viero/execution/relay.js';
 import { WalletClients } from '../src/viero/execution/walletClients.js';
 
 const PRIVATE_KEY = keccak256(toHex('viero-public-test-wallet'));
@@ -20,6 +20,21 @@ test('Relay SDK registers Robinhood Chain 4663 with Viero metadata', () => {
   assert.equal(chain.httpRpcUrl, TEST_RPC);
   assert.equal(chain.viemChain?.id, 4663);
   assert.equal(chain.explorerUrl, 'https://robinhoodchain.blockscout.com');
+});
+
+test('Relay SDK registers BNB Chain 56 with Viero metadata', () => {
+  const client = createClient({
+    baseApiUrl: MAINNET_RELAY_API,
+    apiKey: 'test-key',
+    source: 'viero-tests',
+    chains: relayChains({ VIERO_RPC_4663: TEST_RPC, VIERO_RPC_56: TEST_RPC }),
+  });
+  const chain = client.chains.find(item => item.id === 56);
+  assert.ok(chain);
+  assert.equal(chain.httpRpcUrl, TEST_RPC);
+  assert.equal(chain.viemChain?.id, 56);
+  assert.equal(chain.explorerUrl, 'https://bscscan.com');
+  assert.equal(bnbRelayChain({ VIERO_RPC_56: TEST_RPC }).viemChain?.nativeCurrency.symbol, 'BNB');
 });
 
 test('Relay SDK still rejects an unsupported chain locally', () => {
@@ -40,5 +55,17 @@ test('RelayBalancer exposes 4663 as executable without making a transaction', ()
   const relay = new RelayBalancer(wallets, publicClients, 'test-key');
   if (prior === undefined) delete process.env.VIERO_RPC_4663; else process.env.VIERO_RPC_4663 = prior;
   assert.equal(relay.supportsChain(4663), true);
+  assert.equal(relay.supportsChain(999999), false);
+});
+
+test('RelayBalancer exposes BNB as executable without making a transaction', () => {
+  const wallets = new WalletClients({ VIERO_SIGNER_PRIVATE_KEY: PRIVATE_KEY });
+  const publicClients = { get: () => { throw new Error('network access is not expected in this test'); } } as never;
+  const prior4663 = process.env.VIERO_RPC_4663, prior56 = process.env.VIERO_RPC_56;
+  process.env.VIERO_RPC_4663 = TEST_RPC; process.env.VIERO_RPC_56 = TEST_RPC;
+  const relay = new RelayBalancer(wallets, publicClients, 'test-key');
+  if (prior4663 === undefined) delete process.env.VIERO_RPC_4663; else process.env.VIERO_RPC_4663 = prior4663;
+  if (prior56 === undefined) delete process.env.VIERO_RPC_56; else process.env.VIERO_RPC_56 = prior56;
+  assert.equal(relay.supportsChain(56), true);
   assert.equal(relay.supportsChain(999999), false);
 });

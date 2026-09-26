@@ -243,7 +243,12 @@ export class TokenDiscovery {
     const securityDecisions: NonNullable<TokenDiscoveryCycleResult['securityDecisions']> = [];
     let pass = 0, reject = 0, retryLater = 0;
     const rejectionCounts = new Map<string, number>();
-    const economic = chainId === 4663 ? (this.config.economicFilter ?? ROBINHOOD_ECONOMIC_FILTER) : null;
+    // Robinhood and BNB share the same deterministic discovery economics.
+    // Other chains retain their chain-specific discovery behavior until they
+    // receive an explicit economic policy.
+    const economic = chainId === 4663 || chainId === 56
+      ? (this.config.economicFilter ?? ROBINHOOD_ECONOMIC_FILTER)
+      : null;
     for (const row of rows) {
       // Defensive address parse — GMGN occasionally returns malformed rows.
       let address: Address;
@@ -258,6 +263,10 @@ export class TokenDiscovery {
         ];
         const failed = checks.filter(([, value, threshold]) => !Number.isFinite(value) || value < threshold);
         if (failed.length) {
+          // A token that was previously a PASS may fall below the economic
+          // floor on a later Hot Search fetch. Remove that cached entry so an
+          // old PASS cannot leak into Stage-1 ranking or pool discovery.
+          this.cache.delete(this.cacheKey(chainId, address));
           economicFiltered++;
           const reasons = failed.map(([reason]) => reason);
           for (const reason of reasons) rejectionCounts.set(reason, (rejectionCounts.get(reason) ?? 0) + 1);

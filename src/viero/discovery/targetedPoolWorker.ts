@@ -353,7 +353,7 @@ function dummyPolicy(): Parameters<typeof screen>[1] {
     minimumVolumeUsd: 10000,
     minimumUniqueTraders: 20,
     maximumHolderPct: 40,
-    maximumSellTaxBps: 0,
+    maximumSellTaxBps: 300,
     minimumExpectedNetFeesUsd: 0,
     maximumSlippageBps: 50,
     maximumRangeWidthTicks: 10000,

@@ -102,6 +102,26 @@ test('AUTO size/range resolutions are wired into a single-sided quote-only plann
   assert.ok(quote && quote.amount > 0n); assert.equal(base?.amount, 0n);
 });
 
+test('BNB fixed 50% range uses a single-sided USDT quote deposit without RANGE_LIMIT', async () => {
+  const controls = fixedControls({ enabledChains: [56], fixedRangePct: 50, fixedSizeUsd: 10 });
+  const settings = await resolveExecutionSettings({
+    controls,
+    chainId: 56,
+    ...contexts,
+  });
+  const observation = demoObservations(DEMO_TIME).find(o => o.state.pool.chainId === 56 && o.state.pool.protocol === 'v3' && o.state.pool.dex === 'pancakeswap')!;
+  const candidate = screen(observation, DEFAULT_POLICY, DEMO_TIME);
+  assert.deepEqual(candidate.rejections, []);
+  const plan = planPosition(observation, candidate, settings.positionSizeUsd, DEFAULT_POLICY,
+    { totalExposureUsd: 0, chainExposureUsd: {}, dailyLossUsd: 0 }, DEMO_TIME, undefined, 'paper', settings);
+  const quote = getChain(56).primaryStable.toLowerCase();
+  const quoteAsset = plan.depositAssets.find(asset => asset.token.toLowerCase() === quote);
+  const nonQuoteAsset = plan.depositAssets.find(asset => asset.token.toLowerCase() !== quote);
+  assert.ok(quoteAsset && quoteAsset.amount > 0n);
+  assert.equal(nonQuoteAsset?.amount, 0n);
+  assert.ok(plan.tickUpper - plan.tickLower <= DEFAULT_POLICY.maximumRangeWidthTicks);
+});
+
 test('AUTO resolution failure blocks planning when market cap is unavailable', async () => {
   const controls = fixedControls({ sizeMode: 'AUTO' });
   await assert.rejects(resolveExecutionSettings({ controls, chainId: 4663, ...contexts, sizeContext: { ...contexts.sizeContext, marketCapUsd: null } }), /MARKET_CAP_UNAVAILABLE/);

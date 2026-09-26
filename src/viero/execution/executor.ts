@@ -4,6 +4,7 @@ import { erc20ExecutionAbi, erc20TransferEvent, erc721TransferEvent, permit2Abi,
 import { verifyPool } from '../adapters/pools.js';
 import { PublicClients, assertChain } from '../clients/publicClients.js';
 import { getChain } from '../config/chains.js';
+import { usesSingleSidedQuoteExecution } from '../config/policy.js';
 import { poolIdentity, type ChainId, type Observation } from '../domain.js';
 import { type Policy } from '../config/policy.js';
 import { canonicalPrice } from '../screening/pipeline.js';
@@ -207,10 +208,10 @@ export class LiveExecutor {
       await assertChain(client, plan.chainId);
       const latest = await verifyPool(client, plan.pool);
       if (!latest.verified) throw new Error('POOL_UNVERIFIED');
-      if (plan.chainId === 4663) Object.assign(plan, refreshFixedRangePlan(plan, latest, observation.prices, this.policy ?? undefined));
+      if (usesSingleSidedQuoteExecution(plan.chainId)) Object.assign(plan, refreshFixedRangePlan(plan, latest, observation.prices, this.policy ?? undefined));
       else if (latest.tick < plan.tickLower || latest.tick >= plan.tickUpper) throw new Error('ENTRY_STATE_MOVED_OUTSIDE_PLANNED_RANGE');
-      if (plan.chainId === 4663 && plan.pool.protocol === 'v4') {
-        const chainConfig = getChain(4663), stable = chainConfig.primaryStable.toLowerCase(), wrapped = chainConfig.wrappedNative?.toLowerCase();
+      if (usesSingleSidedQuoteExecution(plan.chainId) && plan.pool.protocol === 'v4') {
+        const chainConfig = getChain(plan.chainId), stable = chainConfig.primaryStable.toLowerCase(), wrapped = chainConfig.wrappedNative?.toLowerCase();
         const quote = plan.depositAssets.find(a => a.token.toLowerCase() === stable || a.token.toLowerCase() === wrapped);
         const opposite = plan.depositAssets.find(a => a.token.toLowerCase() !== quote?.token.toLowerCase());
         if (!quote || !opposite || quote.amount <= 0n || opposite.amount !== 0n || plan.liquidity <= 0n) {

@@ -63,7 +63,7 @@ export type TokenEvidence = {
 };
 
 export interface TokenScreeningPolicy {
-  maximumSellTaxBps: number;          // default 0 (Meridian default — no tax tolerance)
+  maximumSellTaxBps: number;          // default 300 (3% maximum sell-tax tolerance)
   maximumHolderPct: number;           // default 40 (matches Viero DEFAULT_POLICY)
   minimumAgeSeconds: number;          // default 86400 (1 day)
   cooldownSeconds: number;            // pool cooldown after loss exit

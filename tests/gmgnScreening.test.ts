@@ -171,10 +171,16 @@ test('screen({ dataAvailability: "gmgn-only" }) still rejects on HONEYPOT via GM
 
 test('screen({ dataAvailability: "gmgn-only" }) still rejects on SELL_TAX via GMGN risk', () => {
   const obs = makeObservation({
-    risks: [risk({ sellTaxBps: 200 })], // > policy.maximumSellTaxBps=0
+    risks: [risk({ sellTaxBps: 400 })], // > policy.maximumSellTaxBps=300
   });
   const c = screen(obs, DEFAULT_POLICY, 1_700_000_000, { dataAvailability: 'gmgn-only' });
   assert.ok(c.rejections.some(r => r.code === 'SELL_TAX'));
+});
+
+test('300 bps sell tax is accepted at the configured boundary', () => {
+  const obs = makeObservation({ risks: [risk({ sellTaxBps: 300 })] });
+  const c = screen(obs, DEFAULT_POLICY, 1_700_000_000, { dataAvailability: 'gmgn-only' });
+  assert.equal(c.rejections.some(r => r.code === 'SELL_TAX'), false);
 });
 
 test('screen({ dataAvailability: "gmgn-only" }) still rejects on SIMULATION_REQUIRED via GMGN risk', () => {

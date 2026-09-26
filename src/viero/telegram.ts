@@ -753,10 +753,10 @@ export class TelegramBot {
       const tx = result.transactions.at(-1)?.hash;
       if (kind === 'claim') await this.send(chatId, tx ? `✅ Fees claimed\n${tx}` : '✅ Fees claimed.');
       else {
-        const closedText = formatClosePositionMessage({ symbol: position.plan.pool.protocol === 'v4' ? 'V4 position' : 'V3 position', protocol: position.plan.pool.protocol,
+        const closedText = formatClosePositionMessage({ symbol: result.symbol ?? (position.plan.pool.protocol === 'v4' ? 'V4 position' : 'V3 position'), protocol: position.plan.pool.protocol,
           tokenId: position.tokenId, poolAddress: position.pool.protocol === 'v3' ? position.pool.poolAddress : position.pool.poolId, reason: position.closeReason ?? 'MANUAL',
           quoteAmount: null, depositUsd: position.plan.depositUsd, lowerPrice: null, upperPrice: null,
-          entryPrice: null, exitPrice: null, currentValueUsd: null, pnlPct: null, pnlUsd: null,
+          entryPrice: null, exitPrice: null, currentValueUsd: null, pnlPct: result.pnlPct ?? null, pnlUsd: null,
           txHash: tx, blockExplorerTxBase: `${getChain(position.chainId).explorerUrl}/tx`, positionBase: position.plan.pool.protocol === 'v4' ? 'https://app.uniswap.org/positions/v4/robinhood' : undefined,
           normalization: kind === 'autoswap' && !result.normalized ? { pending: true } : undefined });
         await this.send(chatId, closedText);
