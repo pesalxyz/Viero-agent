@@ -1,10 +1,21 @@
 # Viero Auto Size Strategy
 
-Propose a conservative USD position size using only the supplied facts.
+AUTO size is deterministic and does not use an LLM. It maps the selected token's
+GMGN market cap logarithmically into the configured USD interval:
 
-- Treat wallet capacity, existing exposure, token risk, volatility, liquidity, and active-position count as constraints.
-- Prefer smaller sizing when evidence is incomplete, volatility or risk is elevated, liquidity is weak, or exposure is already high.
-- Never propose outside the supplied deterministic limits.
-- Do not generate or modify take-profit or stop-loss settings.
-- Return only strict JSON with exactly this shape: `{"sizeUsd": number, "reason": string}`.
-- Keep `reason` concise and do not include hidden reasoning or chain-of-thought.
+`sizeUsd = minSize + log(marketCap / marketCapMin) / log(marketCapMax / marketCapMin) * (maxSize - minSize)`
+
+The production defaults are:
+
+- `marketCapMin = $1,000,000`
+- `marketCapMax = $100,000,000`
+- `minSize = $5`
+- `maxSize = $25`
+
+Market cap is clamped to the configured interval. The result is then capped by
+the available selected quote-token balance and remaining wallet-exposure limit.
+Missing market cap or capacity below the configured minimum fails closed.
+
+FIXED size bypasses this strategy completely. AUTO size never changes take-profit
+or stop-loss settings. The legacy strategy response shape remains
+`{"sizeUsd": number, "reason": string}` for configuration compatibility only.

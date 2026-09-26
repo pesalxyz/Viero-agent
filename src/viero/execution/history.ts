@@ -34,8 +34,11 @@ export function recordClosedOutcome(state: StrategyState, observation: Observati
   const position = state.positions.find(item => item.id === positionId);
   if (!position) throw new Error('POSITION_NOT_FOUND');
   const identity = poolIdentity(position.pool), riskExit = /HONEYPOT|ADMIN|SELL|RISK|DEPTH|PRICE/i.test(reason), loss = pnlUsd !== null && pnlUsd < 0;
+  const closeBasisUsd = position.entryPrincipalUsd ?? position.plan.depositUsd;
+  const realizedPnlPct = pnlUsd !== null && closeBasisUsd > 0 ? pnlUsd / closeBasisUsd * 100 : null;
+  const farAboveGrace = reason === 'FAR_ABOVE_RANGE' && realizedPnlPct !== null && realizedPnlPct >= policy.farAboveRangeBlacklistGracePct;
   state.cooldowns[identity] = now + policy.poolCooldownSeconds;
-  if (riskExit || loss) {
+  if (riskExit || (loss && !farAboveGrace)) {
     const chain = getChain(position.chainId);
     const trusted = new Set([chain.primaryStable, chain.wrappedNative].filter(Boolean).map((address) => address!.toLowerCase()));
     // Deposit assets are normally quote-only, so derive the candidate/base

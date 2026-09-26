@@ -283,6 +283,33 @@ test('recordClosedOutcome on a winning close does not blacklist tokens', () => {
   assert.equal(state.lessons[0]!.outcome, 'win');
 });
 
+test('FAR_ABOVE_RANGE close within the configured loss grace does not blacklist the token', () => {
+  const obs = demoObservations()[0]!;
+  const now = obs.state.observedAt;
+  const state = {
+    version: 1 as const, positions: [{ ...makeLivePosition(), id: 'p' }], transactions: [], cooldowns: {} as Record<string, number>,
+    blacklist: {} as Record<string, { until: number; reason: string }>,
+    lessons: [] as Array<{ at: number; chainId: ChainId; poolIdentity: string; outcome: 'win' | 'loss' | 'risk-exit'; pnlUsd: number | null; reason: string }>,
+    dailyRealizedLossUsd: {} as Record<string, number>,
+  };
+  recordClosedOutcome(state, obs, 'p', 'FAR_ABOVE_RANGE', now, DEFAULT_POLICY, -0.2);
+  assert.equal(state.blacklist[tokenKey(0)], undefined);
+  assert.equal(state.blacklist[tokenKey(1)], undefined);
+});
+
+test('FAR_ABOVE_RANGE close beyond the configured loss grace still blacklists the token', () => {
+  const obs = demoObservations()[0]!;
+  const now = obs.state.observedAt;
+  const state = {
+    version: 1 as const, positions: [{ ...makeLivePosition(), id: 'p' }], transactions: [], cooldowns: {} as Record<string, number>,
+    blacklist: {} as Record<string, { until: number; reason: string }>,
+    lessons: [] as Array<{ at: number; chainId: ChainId; poolIdentity: string; outcome: 'win' | 'loss' | 'risk-exit'; pnlUsd: number | null; reason: string }>,
+    dailyRealizedLossUsd: {} as Record<string, number>,
+  };
+  recordClosedOutcome(state, obs, 'p', 'FAR_ABOVE_RANGE', now, DEFAULT_POLICY, -1);
+  assert.ok(Object.keys(state.blacklist).length > 0);
+});
+
 // ─── liveManagementDecision ───────────────────────────────────
 
 test('liveManagementDecision returns one of the allowed actions for an accepted observation', () => {

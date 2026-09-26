@@ -232,6 +232,7 @@ export class Agent {
               criticalAdmin: t.criticalAdmin,
               smartMoneyScore: t.smartMoneyScore,
               volume1h: t.volume1h,
+              marketCapUsd: t.marketCapUsd,
               liquidityUsd: (() => { const e = entries.find(entry => entry.address.toLowerCase() === t.tokenAddress.toLowerCase()); return Number.isFinite(e?.liquidity) ? e?.liquidity : null; })(),
               hotSearchRank: t.hotSearchRank,
               tokenAgeSeconds: t.tokenAgeSeconds,
@@ -262,6 +263,7 @@ export class Agent {
       run.selectedTokenAddress = winner.tokenAddress;
       run.selectedTokenSymbol = winner.symbol;
       run.selectedTokenVolume1h = volume;
+      run.selectedTokenMarketCapUsd = (run.tokenDecisions ?? []).find(item => item.chainId === winner.chainId && item.tokenAddress.toLowerCase() === winner.tokenAddress.toLowerCase())?.marketCapUsd ?? null;
       const initialBotState = controls.botState ?? 'STOPPED';
       run.candidateHandoff = { selectedTokenAddress: winner.tokenAddress, selectedTokenSymbol: winner.symbol, status: 'NOT_ATTEMPTED', reason: null, controlsBotState: initialBotState, initialBotState, timestamp: Date.now() / 1000 };
     }
@@ -308,6 +310,7 @@ export class Agent {
       run.selectedTokenAddress = selected.tokenAddress;
       run.selectedTokenSymbol = selectedDecision?.symbol;
       run.selectedTokenVolume1h = selectedDecision?.volume1h ?? null;
+      run.selectedTokenMarketCapUsd = selectedDecision?.marketCapUsd ?? null;
       const memoryKey = `${selected.chainId}:${selected.tokenAddress.toLowerCase()}`;
       const memoryEntry = tokenMemory[memoryKey];
       if (memoryEntry) { memoryEntry.candidateAttempts += 1; memoryEntry.lastAttemptAt = Date.now() / 1000; memoryEntry.lastAttemptResult = 'HANDED_OFF'; memoryEntry.lastPoolId = selected.poolId; await this.tokenMemory.save(tokenMemory); }
@@ -370,7 +373,7 @@ export class Agent {
    * Rank freshly-PASSed tokens from evidence retained by TokenDiscovery.
    * This performs no provider or RPC calls.
    */
-  private rankScreenedTokens(chainId: ChainId, entries: ReadonlyArray<{ address: Address; hotSearchRank?: number | null; symbol?: string; name?: string; volume1h?: number | null; lastTokenScreenResult: 'PASS' | 'REJECT' | 'RETRY_LATER'; rejectReason?: import('../discovery/tokenScreener.js').TokenRejectionCode; risk?: Risk }>) {
+  private rankScreenedTokens(chainId: ChainId, entries: ReadonlyArray<{ address: Address; hotSearchRank?: number | null; symbol?: string; name?: string; marketCapUsd?: number | null; volume1h?: number | null; lastTokenScreenResult: 'PASS' | 'REJECT' | 'RETRY_LATER'; rejectReason?: import('../discovery/tokenScreener.js').TokenRejectionCode; risk?: Risk }>) {
     const items = entries.map(entry => ({ chainId, tokenAddress: entry.address, risk: entry.risk ?? null, entry: { hotSearchRank: entry.hotSearchRank ?? null } }));
     const ranked = this.rankTokens(items);
     return ranked.map((r) => {
@@ -379,6 +382,7 @@ export class Agent {
       return {
         chainId: r.chainId, tokenAddress: r.tokenAddress, rank: r.rank,
         symbol: entry.symbol, name: entry.name,
+        marketCapUsd: entry.marketCapUsd ?? null,
         volume1h: entry.volume1h ?? null,
         verdict: entry.lastTokenScreenResult,
         rejectReason: entry.rejectReason,
@@ -510,15 +514,19 @@ export class Agent {
         if (mode === 'live-execution' && (!this.signer || !strategy || !wallet)) throw new Error('SIGNER_NOT_CONFIGURED');
         const tokenPrices = new Map(state ? [state.token0, state.token1].map(token => [token.address,
           canonicalPrice(observation.prices, token.address, now, this.policy)?.usd ?? null] as const) : []);
-        const availableExecutionBalanceUsd = wallet ? [state.token0, state.token1].reduce((sum, token) => {
-          const price = tokenPrices.get(token.address), amount = wallet.tokens.get(token.address);
-          return price != null && amount !== undefined ? sum + Number(amount) / 10 ** token.decimals * price : sum;
-        }, 0) : null;
+        const chainConfig = getChain(chainId);
+        const quoteToken = [state.token0, state.token1].find(token => token.address.toLowerCase() === chainConfig.primaryStable.toLowerCase()
+          || token.address.toLowerCase() === chainConfig.wrappedNative?.toLowerCase());
+        const availableExecutionBalanceUsd = wallet && quoteToken ? (() => {
+          const price = tokenPrices.get(quoteToken.address), amount = wallet.tokens.get(quoteToken.address);
+          return price != null && amount !== undefined ? Number(amount) / 10 ** quoteToken.decimals * price : null;
+        })() : null;
         const settings = await resolveExecutionSettings({
           controls, chainId, llm: this.strategyLlm,
           sizeContext: {
             walletEquityUsd: availableExecutionBalanceUsd === null ? null : availableExecutionBalanceUsd + exposure.totalExposureUsd,
             availableExecutionBalanceUsd,
+            marketCapUsd: run.selectedTokenMarketCapUsd ?? null,
             existingExposureUsd: exposure.totalExposureUsd,
             activePositions: open.length,
             tokenRisk: risks,
@@ -802,8 +810,8 @@ export class Agent {
         try {
           const normalized = await this.signer.normalize(position);
           state.positions[index] = normalized.value; state.transactions.push(...normalized.transactions);
-          const normalizationTx = normalized.transactions.find(transaction => transaction.action === 'swap')?.hash ?? normalized.transactions.at(-1)?.hash;
-          enqueue({ id: `${position.id}:normalization:${normalized.value.normalization.attempts}`, kind: 'normalization', positionId: position.id, protocol: position.plan.pool.protocol, tokenId: position.tokenId.toString(), symbol: positionSymbol(position), targetSymbol: positionTargetSymbol(position), status: 'SUCCESS', txHash: normalizationTx, at: now });
+          const normalizationTx = normalized.transactions.find(transaction => transaction.action === 'swap')?.hash;
+          if (normalizationTx) enqueue({ id: `${position.id}:normalization:${normalized.value.normalization.attempts}`, kind: 'normalization', positionId: position.id, protocol: position.plan.pool.protocol, tokenId: position.tokenId.toString(), symbol: positionSymbol(position), targetSymbol: positionTargetSymbol(position), status: 'SUCCESS', txHash: normalizationTx, at: now });
           results.push({ positionId: position.id, action: 'normalize', reason: 'POST_CLOSE_INVENTORY_NORMALIZED', transactionHashes: normalized.transactions.map(transaction => transaction.hash) });
         } catch (error) {
           position.updatedAt = now;
@@ -902,7 +910,8 @@ export class Agent {
           if (state.positions[index]?.normalization.status === 'complete') {
             const normalized = state.positions[index]!;
             const normalizationTx = hashes.at(-1);
-            enqueue({ id: `${position.id}:normalization:${normalized.normalization.attempts}`, kind: 'normalization', positionId: position.id, protocol: position.plan.pool.protocol, tokenId: position.tokenId.toString(), symbol: positionSymbol(position, confirmation), targetSymbol: positionTargetSymbol(position, confirmation), status: 'SUCCESS', txHash: normalizationTx, at: now });
+            const hasSwap = state.transactions.some(transaction => transaction.positionId === position.id && transaction.action === 'swap' && transaction.hash === normalizationTx);
+            if (hasSwap) enqueue({ id: `${position.id}:normalization:${normalized.normalization.attempts}`, kind: 'normalization', positionId: position.id, protocol: position.plan.pool.protocol, tokenId: position.tokenId.toString(), symbol: positionSymbol(position, confirmation), targetSymbol: positionTargetSymbol(position, confirmation), status: 'SUCCESS', txHash: normalizationTx, at: now });
           }
         } else {
           position.updatedAt = now; position.lastAction = decision.action;

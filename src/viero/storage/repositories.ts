@@ -21,6 +21,7 @@ export type AgentRun = {
   selectedTokenAddress?: Address;
   selectedTokenSymbol?: string;
   selectedTokenVolume1h?: number | null;
+  selectedTokenMarketCapUsd?: number | null;
   candidateHandoff?: { selectedTokenAddress: Address; selectedTokenSymbol?: string; status: 'NOT_ATTEMPTED' | 'SKIPPED' | 'POOL_LOOKUP' | 'READY' | 'EXECUTED'; reason: 'BOT_STOPPED' | 'NO_SUPPORTED_POOL' | 'PROVIDER_FAILURE' | null; controlsBotState: 'RUNNING' | 'STOPPED'; initialBotState?: 'RUNNING' | 'STOPPED'; preEnrichmentBotState?: 'RUNNING' | 'STOPPED'; preExecutionBotState?: 'RUNNING' | 'STOPPED'; timestamp: number };
   poolDiscovery?: PoolDiscoveryEvidence;
   stage1Ranking?: { eligibleCount: number; exclusions: Array<{ reason: string; count: number }>; ranked: Array<{ chainId: ChainId; tokenAddress: Address; symbol?: string; score: number; volume1h: number; liquidityUsd: number; hotSearchRank: number }> };
@@ -34,7 +35,7 @@ export type AgentRun = {
   tokenDecisions: Array<{ chainId: ChainId; tokenAddress: Address; symbol?: string; name?: string;
     verdict: 'PASS' | 'REJECT' | 'RETRY_LATER'; rejectReason?: string;
     holdersTop10Pct?: number | null; sellTaxBps?: number | null;
-    volume1h?: number | null; liquidityUsd?: number | null;
+    volume1h?: number | null; liquidityUsd?: number | null; marketCapUsd?: number | null;
     buySimulation?: boolean | null; sellSimulation?: boolean | null;
     honeypot?: boolean | null; criticalAdmin?: boolean | null;
     smartMoneyScore?: number | null; hotSearchRank?: number | null;
@@ -62,9 +63,12 @@ export const controlsSchema = z.object({
   stopLossPct: z.number().finite().negative().nullable().default(null),
   minAutoSizeUsd: z.number().finite().positive().default(5),
   maxAutoSizeUsd: z.number().finite().positive().default(25),
+  autoSizeMarketCapMinUsd: z.number().finite().positive().default(1_000_000),
+  autoSizeMarketCapMaxUsd: z.number().finite().positive().default(100_000_000),
   maxWalletExposurePct: z.number().finite().positive().max(100).default(5),
-  minAutoRangePct: z.number().finite().min(1).max(99).default(5),
-  maxAutoRangePct: z.number().finite().min(1).max(99).default(30),
+  minAutoRangePct: z.number().finite().min(1).max(99).default(30),
+  maxAutoRangePct: z.number().finite().min(1).max(99).default(85),
+  autoRangeVolatilityReferencePct: z.number().finite().positive().default(5),
   lastAutoReportRunId: z.string().uuid().nullable().default(null),
 }).strict();
 export type Controls = {
@@ -72,8 +76,8 @@ export type Controls = {
   rangeMode?: StrategyMode | null; fixedRangePct?: number | null;
   sizeMode?: StrategyMode | null; fixedSizeUsd?: number | null;
   enabledChains?: ChainId[]; takeProfitPct?: number | null; stopLossPct?: number | null;
-  minAutoSizeUsd?: number; maxAutoSizeUsd?: number; maxWalletExposurePct?: number;
-  minAutoRangePct?: number; maxAutoRangePct?: number;
+  minAutoSizeUsd?: number; maxAutoSizeUsd?: number; autoSizeMarketCapMinUsd?: number; autoSizeMarketCapMaxUsd?: number; maxWalletExposurePct?: number;
+  minAutoRangePct?: number; maxAutoRangePct?: number; autoRangeVolatilityReferencePct?: number;
   lastAutoReportRunId?: string | null;
 };
 export interface Repository {

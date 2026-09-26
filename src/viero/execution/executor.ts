@@ -197,9 +197,9 @@ export class LiveExecutor {
       await assertChain(client, plan.chainId);
       const latest = await verifyPool(client, plan.pool);
       if (!latest.verified) throw new Error('POOL_UNVERIFIED');
-      if (plan.rangeMode === 'FIXED' && plan.chainId === 4663) Object.assign(plan, refreshFixedRangePlan(plan, latest, observation.prices, this.policy ?? undefined));
+      if (plan.chainId === 4663) Object.assign(plan, refreshFixedRangePlan(plan, latest, observation.prices, this.policy ?? undefined));
       else if (latest.tick < plan.tickLower || latest.tick >= plan.tickUpper) throw new Error('ENTRY_STATE_MOVED_OUTSIDE_PLANNED_RANGE');
-      if (plan.rangeMode === 'FIXED' && plan.chainId === 4663 && plan.pool.protocol === 'v4') {
+      if (plan.chainId === 4663 && plan.pool.protocol === 'v4') {
         const chainConfig = getChain(4663), stable = chainConfig.primaryStable.toLowerCase(), wrapped = chainConfig.wrappedNative?.toLowerCase();
         const quote = plan.depositAssets.find(a => a.token.toLowerCase() === stable || a.token.toLowerCase() === wrapped);
         const opposite = plan.depositAssets.find(a => a.token.toLowerCase() !== quote?.token.toLowerCase());

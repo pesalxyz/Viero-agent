@@ -64,6 +64,7 @@ export type TokenDiscoveryEntry = {
   rejectReason?: TokenRejectionCode;
   /** GMGN evidence retained for deterministic token ranking without a second provider call. */
   risk?: Risk;
+  marketCapUsd?: number;
   volume1h?: number;
   liquidity?: number;
   /** Earliest Unix seconds the screener should re-run for this token. */
@@ -268,10 +269,13 @@ export class TokenDiscovery {
       }
       const key = this.cacheKey(chainId, address);
       const existing = this.cache.get(key);
+      const marketCap = row.market_cap == null ? undefined : Number(row.market_cap);
+      const marketCapUsd = marketCap !== undefined && Number.isFinite(marketCap) && marketCap > 0 ? marketCap : undefined;
       if (!existing) {
         const entry: TokenDiscoveryEntry = {
           chainId, address,
           symbol: row.symbol, name: row.name,
+          marketCapUsd,
           volume1h: typeof row.volume === 'number' ? row.volume : row.volume == null ? undefined : Number(row.volume),
           liquidity: typeof row.liquidity === 'number' ? row.liquidity : row.liquidity == null ? undefined : Number(row.liquidity),
           hotSearchRank: row.rank,
@@ -289,6 +293,7 @@ export class TokenDiscovery {
         if (row.rank !== undefined) existing.hotSearchRank = row.rank;
         if (row.symbol) existing.symbol = row.symbol;
         if (row.name) existing.name = row.name;
+        if (marketCapUsd !== undefined) existing.marketCapUsd = marketCapUsd;
         if (row.volume !== undefined && row.volume !== null) existing.volume1h = Number(row.volume);
         if (row.liquidity !== undefined && row.liquidity !== null) existing.liquidity = Number(row.liquidity);
       }

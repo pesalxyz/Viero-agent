@@ -1,4 +1,4 @@
-import { type Address } from 'viem';
+import { parseUnits, type Address } from 'viem';
 import { getChain } from '../config/chains.js';
 import { CHAIN_LIMITS, type Policy } from '../config/policy.js';
 import { type ChainId, type Observation, type PoolRef, poolIdentity } from '../domain.js';
@@ -35,8 +35,13 @@ export class InsufficientQuoteBalanceError extends Error {
   }
 }
 export function refreshFixedRangePlan(plan: PositionPlan, state: Observation['state'], prices?: Observation['prices'], policy?: Policy): PositionPlan {
-  if (plan.rangeMode !== 'FIXED' || state.pool.chainId !== 4663) return plan;
+  if (state.pool.chainId !== 4663) return plan;
   const quote = quoteAssetForPool(state), stableIs0 = quote.isToken0, stableIs1 = !quote.isToken0;
+  // Preserve the operator-selected fixed-size quote deposit when the final
+  // execution read observes a moved price/range. Reusing the old liquidity
+  // alone changes the quote amount as the range is rebuilt, which can turn a
+  // $10 fixed plan into a materially smaller mint.
+  const plannedQuoteAmount = plan.depositAssets.find(asset => asset.token.toLowerCase() === quote.address.toLowerCase())?.amount ?? 0n;
   const current = humanQuotePriceFromSqrt({ sqrtPriceX96: state.sqrtPriceX96, quoteIsToken0: stableIs0, decimals0: state.token0.decimals, decimals1: state.token1.decimals });
   const lowerHuman = current * (1 - plan.rangePct / 100), upperHuman = current * 0.995;
   const lowerBound = tickAtHumanQuotePrice({ quotePerMeme: lowerHuman, quoteIsToken0: stableIs0, decimals0: state.token0.decimals, decimals1: state.token1.decimals, tickSpacing: state.tickSpacing, round: stableIs0 ? 'up' : 'down' });
@@ -51,14 +56,26 @@ export function refreshFixedRangePlan(plan: PositionPlan, state: Observation['st
   if (lower >= upper || (stableIs0 ? state.tick >= lower : state.tick <= upper)) throw new Error('FIXED_RANGE_NOT_SINGLE_SIDED_QUOTE');
   if (lower < -887272 || upper > 887272) throw new Error('FIXED_RANGE_TICK_INVALID');
   const lo = sqrtAtTick(lower), hi = sqrtAtTick(upper);
-  const assets = stableIs0 ? [{ token: state.token0.address, amount: amount0Delta(state.sqrtPriceX96, hi, plan.liquidity) }, { token: state.token1.address, amount: 0n }] : [{ token: state.token0.address, amount: 0n }, { token: state.token1.address, amount: amount1Delta(lo, state.sqrtPriceX96, plan.liquidity) }];
+  const currentQuoteAmount = stableIs0 ? amount0Delta(state.sqrtPriceX96, hi, plan.liquidity) : amount1Delta(lo, state.sqrtPriceX96, plan.liquidity);
+  const scaledLiquidity = plannedQuoteAmount > 0n && currentQuoteAmount > 0n
+    ? plan.liquidity * plannedQuoteAmount / currentQuoteAmount
+    : 0n;
+  // Tiny synthetic/legacy plans can round below one liquidity unit. Keep the
+  // original plan in that case; real fixed-size quote amounts are many orders
+  // of magnitude larger and take the rescaled branch above.
+  let effectiveLiquidity = scaledLiquidity > 0n ? scaledLiquidity : plan.liquidity;
+  const scaledQuoteAmount = stableIs0 ? amount0Delta(state.sqrtPriceX96, hi, effectiveLiquidity) : amount1Delta(lo, state.sqrtPriceX96, effectiveLiquidity);
+  // Preserve compatibility with tiny synthetic plans whose integer math
+  // cannot represent a scaled liquidity unit.
+  if (scaledQuoteAmount === 0n && plannedQuoteAmount > 0n) effectiveLiquidity = plan.liquidity;
+  const assets = stableIs0 ? [{ token: state.token0.address, amount: amount0Delta(state.sqrtPriceX96, hi, effectiveLiquidity) }, { token: state.token1.address, amount: 0n }] : [{ token: state.token0.address, amount: 0n }, { token: state.token1.address, amount: amount1Delta(lo, state.sqrtPriceX96, effectiveLiquidity) }];
   const snapshotNow = Math.max(state.observedAt, state.fetchedAt);
   const p0 = prices && policy ? canonicalPrice(prices, state.token0.address, snapshotNow, policy)?.usd : undefined;
   const p1 = prices && policy ? canonicalPrice(prices, state.token1.address, snapshotNow, policy)?.usd : undefined;
   const depositUsd = p0 != null && p1 != null
     ? tokenValue(assets[0]!.amount, state.token0.decimals, p0) + tokenValue(assets[1]!.amount, state.token1.decimals, p1)
     : plan.depositUsd;
-  return { ...plan, sourceBlock: state.blockNumber, sourceBlockHash: state.blockHash, tickLower: lower, tickUpper: upper, poolFee: state.fee, depositAssets: assets, expectedTransfers: assets.map(a => ({ token: a.token, direction: 'out' as const, maximumAmount: a.amount })), depositUsd };
+  return { ...plan, sourceBlock: state.blockNumber, sourceBlockHash: state.blockHash, tickLower: lower, tickUpper: upper, poolFee: state.fee, liquidity: effectiveLiquidity, depositAssets: assets, expectedTransfers: assets.map(a => ({ token: a.token, direction: 'out' as const, maximumAmount: a.amount })), depositUsd };
 }
 export function planPosition(observation: Observation, candidate: Candidate, budgetUsd: number, policy: Policy,
   portfolio: PortfolioLimits, now: number, wallet?: { native: bigint; tokens: Map<Address, bigint> }, mode: 'paper' | 'live' = 'paper',
@@ -81,7 +98,7 @@ export function planPosition(observation: Observation, candidate: Candidate, bud
   if (portfolio.totalExposureUsd + budgetUsd > policy.maximumExposureUsd || (portfolio.chainExposureUsd[id] ?? 0) + budgetUsd > CHAIN_LIMITS[id].maximumExposureUsd) throw new Error('EXPOSURE_LIMIT');
   const snapshotNow = Math.max(observation.state.observedAt, observation.state.fetchedAt, observation.windowEnd, ...observation.prices.map(p => Math.max(p.observedAt, p.fetchedAt)));
   let tickLower: number, tickUpper: number;
-  if (settings?.rangeMode === 'FIXED' && id === 4663) {
+  if (settings && id === 4663) {
     const quote = quoteAssetForPool(s), stableIs0 = quote.isToken0, stableIs1 = !quote.isToken0;
     const meme = stableIs0 ? s.token1 : s.token0;
     const memePrice = canonicalPrice(observation.prices, meme.address, snapshotNow, policy)?.usd;
@@ -106,22 +123,40 @@ export function planPosition(observation: Observation, candidate: Candidate, bud
     tickLower = Math.floor((s.tick - lowerWidth) / s.tickSpacing) * s.tickSpacing;
     tickUpper = Math.ceil((s.tick + upperWidth) / s.tickSpacing) * s.tickSpacing;
   }
-  if (tickLower < -887272 || tickUpper > 887272 || tickUpper - tickLower > policy.maximumRangeWidthTicks || tickLower >= tickUpper) throw new Error('RANGE_LIMIT');
+  const configuredWidthLimit = settings?.rangeMode === 'AUTO' && id === 4663
+    ? Math.max(policy.maximumRangeWidthTicks, Math.ceil(Math.abs(Math.log(1 - resolved.rangePct / 100) / Math.log(1.0001))) + s.tickSpacing * 2)
+    : policy.maximumRangeWidthTicks;
+  if (tickLower < -887272 || tickUpper > 887272 || tickUpper - tickLower > configuredWidthLimit || tickLower >= tickUpper) throw new Error('RANGE_LIMIT');
   const p0 = canonicalPrice(observation.prices, s.token0.address, snapshotNow, policy)!.usd;
   const p1 = canonicalPrice(observation.prices, s.token1.address, snapshotNow, policy)!.usd;
   const lower = sqrtAtTick(tickLower), upper = sqrtAtTick(tickUpper), basis = 10n ** 24n;
   const perBasis0 = amount0Delta(s.sqrtPriceX96, upper, basis), perBasis1 = amount1Delta(lower, s.sqrtPriceX96, basis);
   const value = tokenValue(perBasis0, s.token0.decimals, p0) + tokenValue(perBasis1, s.token1.decimals, p1);
   if (!(value > 0)) throw new Error('INVALID_RANGE_VALUATION');
-  // USD is only a sizing estimate; all token arithmetic and transfer bounds remain integers.
-  let liquidity = BigInt(Math.floor(budgetUsd / value * Number(basis)));
+  // Fixed size means the quote transfer itself is sized to the operator's
+  // selected USD amount. Do not size against total range value and then reuse
+  // that liquidity after a price move: that can turn a $10 quote deposit into
+  // a materially smaller mint.
+  let liquidity: bigint;
+  if (settings && id === 4663) {
+    const quote = quoteAssetForPool(s);
+    const quoteToken = quote.isToken0 ? s.token0 : s.token1;
+    const quotePrice = quote.isToken0 ? p0 : p1;
+    const targetQuote = parseUnits((budgetUsd / quotePrice).toFixed(Math.min(quoteToken.decimals, 18)), quoteToken.decimals);
+    const quotePerBasis = quote.isToken0 ? perBasis0 : perBasis1;
+    if (targetQuote <= 0n || quotePerBasis <= 0n) throw new Error('INVALID_FIXED_QUOTE_SIZE');
+    liquidity = targetQuote * basis / quotePerBasis;
+  } else {
+    // Auto/legacy sizing remains value-based and integer bounded.
+    liquidity = BigInt(Math.floor(budgetUsd / value * Number(basis)));
+  }
   if (liquidity <= 0n || liquidity >= 1n << 128n) throw new Error('INVALID_LIQUIDITY');
   const assets = () => [
     { token: s.token0.address, amount: amount0Delta(s.sqrtPriceX96, upper, liquidity) },
     { token: s.token1.address, amount: amount1Delta(lower, s.sqrtPriceX96, liquidity) },
   ];
   let depositAssets = assets();
-  if (settings?.rangeMode === 'FIXED' && id === 4663) {
+  if (settings && id === 4663) {
     const quote = quoteAssetForPool(s), stable = quote.address.toLowerCase(), stableIs0 = quote.isToken0;
     // Outside-range math is directional: mint only the quote asset and
     // explicitly zero the opposite side (no pre-mint swap).

@@ -2,7 +2,7 @@
   "enabledChains": [4663, 56, 8453, 5042],
   "windowMinutes": 30,
   "screeningIntervalSeconds": 300,
-  "managementIntervalSeconds": 180,
+  "managementIntervalSeconds": 300,
   "maximumDataAgeSeconds": 180,
   "maximumExposureUsd": 500,
   "maximumDailyLossUsd": 50,

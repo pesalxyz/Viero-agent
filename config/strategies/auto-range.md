@@ -1,10 +1,18 @@
 # Viero Auto Range Strategy
 
-Propose a conservative single-side range width percentage using only the supplied facts.
+AUTO range is deterministic and does not use an LLM. It creates a single-sided,
+selected-quote-token-only range using:
 
-- Consider available volatility, recent price movement, pool fee tier, liquidity, market activity, and position direction.
-- Wider ranges may suit higher volatility; incomplete evidence should not be presented as certainty.
-- Never propose outside the supplied deterministic limits or the absolute 1–99% range.
-- Do not generate or modify take-profit or stop-loss settings.
-- Return only strict JSON with exactly this shape: `{"rangePct": number, "reason": string}`.
-- Keep `reason` concise and do not include hidden reasoning or chain-of-thought.
+`rangePct = clamp(minRange + volatilityPct / volatilityReferencePct * (maxRange - minRange), minRange, maxRange)`
+
+The production defaults are:
+
+- `minRange = 30%`
+- `maxRange = 85%`
+- `volatilityReference = 5%`
+
+At or above the reference volatility, the range is capped at 85%. Missing or
+invalid volatility fails closed. FIXED range bypasses this strategy completely.
+AUTO range never changes take-profit or stop-loss settings. The legacy strategy
+response shape remains `{"rangePct": number, "reason": string}` for configuration
+compatibility only.

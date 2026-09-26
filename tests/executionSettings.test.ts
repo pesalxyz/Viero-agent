@@ -16,12 +16,12 @@ const fixedControls = (over: Partial<Controls> = {}): Controls => ({
   globalPaused: false, pausedChains: [], botState: 'RUNNING', enabledChains: [4663],
   sizeMode: 'FIXED', fixedSizeUsd: 20, rangeMode: 'FIXED', fixedRangePct: 15,
   takeProfitPct: 12, stopLossPct: -8,
-  minAutoSizeUsd: 5, maxAutoSizeUsd: 25, maxWalletExposurePct: 5,
-  minAutoRangePct: 5, maxAutoRangePct: 30, ...over,
+  minAutoSizeUsd: 5, maxAutoSizeUsd: 25, autoSizeMarketCapMinUsd: 1_000_000, autoSizeMarketCapMaxUsd: 100_000_000, maxWalletExposurePct: 5,
+  minAutoRangePct: 30, maxAutoRangePct: 85, autoRangeVolatilityReferencePct: 5, ...over,
 });
 
 const contexts = {
-  sizeContext: { walletEquityUsd: 1000, availableExecutionBalanceUsd: 100, existingExposureUsd: 0, activePositions: 0 },
+  sizeContext: { walletEquityUsd: 1000, availableExecutionBalanceUsd: 100, marketCapUsd: 10_000_000, existingExposureUsd: 0, activePositions: 0 },
   rangeContext: { volatilityPct: 2, poolFeeTier: 3000, liquidityUsd: 5_000_000, direction: 'single-side' },
 };
 
@@ -59,7 +59,9 @@ test('coarse V3 tick spacing moves a WETH quote-only range fully outside current
     chainId: 4663 as const, pool: state.pool, mode: 'live' as const, createdAt: DEMO_TIME, deadline: DEMO_TIME + 120,
     sourceBlock: state.blockNumber, sourceBlockHash: state.blockHash, tickLower: -200, tickUpper: 0,
     liquidity: 10n ** 18n, poolFee: state.fee,
-    depositAssets: [{ token: state.token0.address, amount: 1n }, { token: state.token1.address, amount: 0n }],
+    // Use a realistic quote amount so the fixed-size rescaling path is
+    // exercised with non-zero integer liquidity math.
+    depositAssets: [{ token: state.token0.address, amount: 10n ** 18n }, { token: state.token1.address, amount: 0n }],
     expectedTransfers: [], slippageBps: 50, maximumGasCostUsd: 1, depositUsd: 10, positionSizeUsd: 10,
     rangePct: 50, takeProfitPct: 5, stopLossPct: -10, sizeMode: 'FIXED' as const, rangeMode: 'FIXED' as const,
   };
@@ -87,17 +89,22 @@ test('executor refresh recalculates the entry USD baseline from the actual refre
   assert.notEqual(refreshed.depositUsd, plan.depositUsd);
 });
 
-test('AUTO size/range resolutions are wired into the planner snapshot', async () => {
+test('AUTO size/range resolutions are wired into a single-sided quote-only planner snapshot', async () => {
   const controls = fixedControls({ sizeMode: 'AUTO', rangeMode: 'AUTO' });
   const settings = await resolveExecutionSettings({ controls, chainId: 4663, ...contexts, llm: strategyLlm() });
   assert.deepEqual({ size: settings.positionSizeUsd, range: settings.rangePct, sizeMode: settings.sizeMode, rangeMode: settings.rangeMode },
-    { size: 20, range: 15, sizeMode: 'AUTO', rangeMode: 'AUTO' });
+    { size: 15, range: 52, sizeMode: 'AUTO', rangeMode: 'AUTO' });
+  const observation = demoObservations(DEMO_TIME)[0]!, candidate = screen(observation, DEFAULT_POLICY, DEMO_TIME);
+  const plan = planPosition(observation, candidate, settings.positionSizeUsd, DEFAULT_POLICY,
+    { totalExposureUsd: 0, chainExposureUsd: {}, dailyLossUsd: 0 }, DEMO_TIME, undefined, 'paper', settings);
+  const chain = getChain(4663), quote = plan.depositAssets.find(asset => asset.token.toLowerCase() === chain.primaryStable.toLowerCase() || asset.token.toLowerCase() === chain.wrappedNative?.toLowerCase());
+  const base = plan.depositAssets.find(asset => asset.token.toLowerCase() !== quote?.token.toLowerCase());
+  assert.ok(quote && quote.amount > 0n); assert.equal(base?.amount, 0n);
 });
 
-test('AUTO resolution failure blocks planning', async () => {
+test('AUTO resolution failure blocks planning when market cap is unavailable', async () => {
   const controls = fixedControls({ sizeMode: 'AUTO' });
-  const failing: LlmClient = { isEnabled: () => true, providerLabel: () => 'test', async chat() { throw new Error('LLM_HTTP_429'); } };
-  await assert.rejects(resolveExecutionSettings({ controls, chainId: 4663, ...contexts, llm: failing }), /POSITION_SIZE_RESOLUTION_FAILED/);
+  await assert.rejects(resolveExecutionSettings({ controls, chainId: 4663, ...contexts, sizeContext: { ...contexts.sizeContext, marketCapUsd: null } }), /MARKET_CAP_UNAVAILABLE/);
 });
 
 test('disabled chain, missing TP/SL, and STOPPED reject before candidate work', () => {

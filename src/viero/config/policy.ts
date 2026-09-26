@@ -5,8 +5,8 @@ export const POLICY_VERSION = 'paper-policy-1';
 export const policySchema = z.object({
   enabledChains: z.array(chainIdSchema).nonempty().default([...CHAIN_IDS]),
   windowMinutes: z.number().int().min(1).max(1440).default(30),
-  screeningIntervalSeconds: z.number().int().min(60).default(900),
-  managementIntervalSeconds: z.number().int().min(30).default(180),
+  screeningIntervalSeconds: z.number().int().min(60).default(300),
+  managementIntervalSeconds: z.number().int().min(30).default(300),
   maximumDataAgeSeconds: z.number().int().positive().default(180),
   maximumPriceDivergencePct: z.number().finite().min(0).max(100).default(3),
   maximumPositivePriceDivergencePct: z.number().finite().min(0).max(100).default(2.5),
@@ -31,6 +31,7 @@ export const policySchema = z.object({
   trailingDropPct: z.number().finite().positive().default(1.5),
   farAboveRangeEnabled: z.boolean().default(true),
   farAboveRangePct: z.number().finite().nonnegative().default(10),
+  farAboveRangeBlacklistGracePct: z.number().finite().negative().default(-3),
   outOfRangeTimeoutEnabled: z.boolean().default(true),
   outOfRangeTimeoutSeconds: z.number().int().nonnegative().default(1800),
   stopLossPct: z.number().finite().min(0).max(100).default(15),

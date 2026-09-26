@@ -110,6 +110,7 @@ test('Robinhood stock registry filters before screening and preserves non-stock 
   assert.equal(result.discovered, 2);
   assert.equal(securityCalls, 2);
   assert.deepEqual([...discovery.entries()].map(entry => entry.address), [first, second]);
+  assert.deepEqual([...discovery.entries()].map(entry => entry.marketCapUsd), [2_000_000, 2_000_000]);
 });
 
 test('Robinhood stock registry outage fails closed before security screening', async () => {

@@ -340,7 +340,7 @@ function dummyPolicy(): Parameters<typeof screen>[1] {
     enabledChains: [4663, 56, 8453, 5042],
     windowMinutes: 30,
     screeningIntervalSeconds: 300,
-    managementIntervalSeconds: 180,
+    managementIntervalSeconds: 300,
     maximumDataAgeSeconds: 180,
     maximumPriceDivergencePct: 3,
     maximumPositivePriceDivergencePct: 2.5,
@@ -370,7 +370,7 @@ function dummyPolicy(): Parameters<typeof screen>[1] {
     lossBlacklistSeconds: 30 * 86400,
     minimumPositionAgeSeconds: 1800,
     trailingTakeProfitEnabled: true, trailingTriggerPct: 3, trailingDropPct: 1.5,
-    farAboveRangeEnabled: true, farAboveRangePct: 10,
+    farAboveRangeEnabled: true, farAboveRangePct: 10, farAboveRangeBlacklistGracePct: -3,
     outOfRangeTimeoutEnabled: true, outOfRangeTimeoutSeconds: 1800,
   };
 }
