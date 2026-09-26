@@ -22,7 +22,7 @@ import { type PaperPosition, markPaperPosition, openPaperPosition } from '../man
 import { type PoolRef as LivePoolRef } from '../domain.js';
 import { SignerClient } from '../execution/signerClient.js';
 import { historicalRejections, recordClosedOutcome } from '../execution/history.js';
-import { liveManagementDecision, managementPnlPct } from '../management/live.js';
+import { liveManagementDecision, managementPnlPct, managementPrincipalPnlPct } from '../management/live.js';
 import { effectivePnlDepositUsd, pnlPctFromValues } from '../management/pnl.js';
 import { v4FeeGrowthDelta } from '../management/v4Fees.js';
 import { feeGrowthInsideV3, v3UnclaimedFees } from '../management/v3Fees.js';
@@ -54,9 +54,19 @@ export function closeNotificationPnlPct(
   policy: Policy,
   now: number,
   realizedPnlUsd: number | null | undefined,
+  reason?: string,
 ): number | null {
   const canonical = managementPnlPct(position, observation, policy, now);
   if (canonical != null) return canonical;
+  // FAR_ABOVE_RANGE is independently actionable and must not display a
+  // receipt-based loss merely because fee evidence or the volatile token
+  // price was unavailable at the close instant. For quote-only positions,
+  // the canonical principal baseline makes this exactly 0% when no fees are
+  // present, matching the active-position card and management semantics.
+  if (reason === 'FAR_ABOVE_RANGE') {
+    const principalOnly = managementPrincipalPnlPct(position, observation, policy, now);
+    if (principalOnly != null) return principalOnly;
+  }
   const basis = position.entryPrincipalUsd ?? position.plan.depositUsd;
   return realizedPnlUsd != null && Number.isFinite(realizedPnlUsd) && basis > 0
     ? realizedPnlUsd / basis * 100
@@ -672,6 +682,26 @@ export class Agent {
     const observed = await this.observePoolLightweight(position.pool);
     return position.pool.protocol === 'v4' ? this.attachV4Fees(position, observed) : this.attachV3Fees(position, observed);
   }
+  /**
+   * Obtain the same canonical, fee-aware observation used by active-position
+   * cards before making a management decision.  The first lightweight read is
+   * retained for the normal path; when a transient fee/price read leaves PnL
+   * unavailable, retry through the canonical enrichment path once more.  This
+   * path remains read-only and never invokes candidate screening.
+   */
+  private async observeManagementPosition(position: import('../execution/liveState.js').LivePosition, now: number) {
+    let observation = await this.observePositionLightweight(position);
+    if (managementPnlPct(position, observation, this.policy, now) !== null) return observation;
+    try {
+      const enriched = position.pool.protocol === 'v4'
+        ? await this.enrichV4Position(position)
+        : await this.enrichV3Position(position);
+      if (managementPnlPct(position, enriched.observation, this.policy, now) !== null) observation = enriched.observation;
+    } catch (error) {
+      console.error(`[viero.management-observation] position=${position.id} canonical-enrichment-fallback=failed error=${errorMessage(error)}`);
+    }
+    return observation;
+  }
   private carryFreshManagementPrices(fresh: Observation, prior: Observation, now: number): Observation {
     const tokens = [fresh.state.token0, fresh.state.token1];
     const prices = [...fresh.prices];
@@ -824,13 +854,13 @@ export class Agent {
       }
       if (position.status !== 'open') continue;
       try {
-        let observation = await this.observePositionLightweight(position);
+        let observation = await this.observeManagementPosition(position, now);
         // PnL evidence can be absent from an otherwise valid lightweight
         // snapshot when one canonical price read is transiently unavailable.
         // Retry the complete read twice before evaluating rules; if evidence
         // remains absent, PnL rules still fail closed while range rules run.
         for (let retry = 0; managementPnlPct(position, observation, this.policy, now) === null && retry < 2; retry += 1) {
-          observation = await this.observePositionLightweight(position);
+          observation = await this.observeManagementPosition(position, now);
         }
         const inRange = observation.state.tick >= position.plan.tickLower && observation.state.tick < position.plan.tickUpper;
         position.outOfRangeSince = inRange ? null : position.outOfRangeSince ?? now;
@@ -845,7 +875,7 @@ export class Agent {
           const executed = await this.signer.claim(position); state.positions[index] = executed.value;
           state.transactions.push(...executed.transactions); hashes = executed.transactions.map(transaction => transaction.hash);
         } else if (['close', 'rebalance', 'emergency-close'].includes(decision.action)) {
-          let confirmation = this.carryFreshManagementPrices(await this.observePositionLightweight(position), observation, now);
+          let confirmation = this.carryFreshManagementPrices(await this.observeManagementPosition(position, now), observation, now);
           let confirmInRange = confirmation.state.tick >= position.plan.tickLower && confirmation.state.tick < position.plan.tickUpper;
           let confirmedDecision = liveManagementDecision(position, confirmation, this.policy, now);
           // Canonical prices can be transiently unavailable from a single
@@ -854,7 +884,7 @@ export class Agent {
           // silently cancelling a proven SL/TP on one incomplete snapshot.
           const pnlRule = ['STOP_LOSS', 'TAKE_PROFIT', 'TRAILING_TAKE_PROFIT'].includes(decision.reason);
           for (let retry = 0; pnlRule && confirmedDecision.reason.startsWith('PnL unavailable') && retry < 2; retry += 1) {
-            confirmation = this.carryFreshManagementPrices(await this.observePositionLightweight(position), observation, now);
+            confirmation = this.carryFreshManagementPrices(await this.observeManagementPosition(position, now), observation, now);
             confirmInRange = confirmation.state.tick >= position.plan.tickLower && confirmation.state.tick < position.plan.tickUpper;
             confirmedDecision = liveManagementDecision(position, confirmation, this.policy, now);
           }
@@ -881,7 +911,7 @@ export class Agent {
           state.positions[index] = executed.value; state.transactions.push(...executed.transactions); hashes = executed.transactions.map(transaction => transaction.hash);
           recordClosedOutcome(state, observation, position.id, decision.reason, now, this.policy, executed.value.realizedPnlUsd);
           const closeHash = executed.transactions.find(transaction => transaction.action === 'decrease' || transaction.action === 'claim')?.hash;
-          enqueue({ id: `${position.id}:closed:${closeHash ?? Math.floor(now)}`, kind: 'closed', positionId: position.id, protocol: position.plan.pool.protocol, tokenId: position.tokenId.toString(), symbol: positionSymbol(position, confirmation), reason: decision.reason, pnlPct: closeNotificationPnlPct(position, confirmation, this.policy, now, executed.value.realizedPnlUsd), valueUsd: (confirmation as any).valueUsd ?? null, feeUsd: (confirmation as any).feeUsd ?? null, txHash: closeHash, status: 'SUCCESS', at: now });
+          enqueue({ id: `${position.id}:closed:${closeHash ?? Math.floor(now)}`, kind: 'closed', positionId: position.id, protocol: position.plan.pool.protocol, tokenId: position.tokenId.toString(), symbol: positionSymbol(position, confirmation), reason: decision.reason, pnlPct: closeNotificationPnlPct(position, confirmation, this.policy, now, executed.value.realizedPnlUsd, decision.reason), valueUsd: (confirmation as any).valueUsd ?? null, feeUsd: (confirmation as any).feeUsd ?? null, txHash: closeHash, status: 'SUCCESS', at: now });
           const closedMemory = await this.tokenMemory.load(), closedKey = `${position.chainId}:${(position.plan.depositAssets[0]?.token ?? '').toLowerCase()}`, closedEntry = closedMemory[closedKey];
           if (closedEntry) { closedEntry.closedPositions += 1; closedEntry.lastCloseAt = now; closedEntry.lastCloseReason = decision.reason; const closeBasisUsd = position.entryPrincipalUsd ?? position.plan.depositUsd; const pnl = executed.value.realizedPnlUsd == null || !closeBasisUsd ? null : executed.value.realizedPnlUsd / closeBasisUsd * 100; if (pnl != null) { const n = closedEntry.closedPositions; closedEntry.averagePnlPct = ((closedEntry.averagePnlPct * (n - 1)) + pnl) / n; } if (decision.reason === 'TAKE_PROFIT' || decision.reason === 'TRAILING_TAKE_PROFIT') { closedEntry.wins += 1; closedEntry.consecutiveStopLossCloses = 0; closedEntry.consecutiveOutOfRangeCloses = 0; } else if (decision.reason === 'STOP_LOSS') { closedEntry.losses += 1; closedEntry.consecutiveStopLossCloses += 1; closedEntry.consecutiveOutOfRangeCloses = 0; } else if (decision.reason === 'OUT_OF_RANGE_TIMEOUT') { closedEntry.consecutiveOutOfRangeCloses += 1; closedEntry.consecutiveStopLossCloses = 0; } else if (decision.reason === 'FAR_ABOVE_RANGE') { closedEntry.consecutiveOutOfRangeCloses = 0; closedEntry.consecutiveStopLossCloses = 0; if (pnl != null) pnl >= 0 ? closedEntry.wins += 1 : closedEntry.losses += 1; } await this.tokenMemory.save(closedMemory); }
           // Persist the confirmed close before normalization. If Relay fails

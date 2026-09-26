@@ -23,10 +23,11 @@ import {
   historicalRejections,
   recordClosedOutcome,
 } from '../src/viero/execution/history.js';
-import { liveManagementDecision, normalizeHumanRange } from '../src/viero/management/live.js';
+import { liveManagementDecision, managementPrincipalPnlPct, normalizeHumanRange } from '../src/viero/management/live.js';
 import { effectivePnlDepositUsd, isPrimaryStableQuoteOnly, pnlPctFromValues } from '../src/viero/management/pnl.js';
 import { screen } from '../src/viero/screening/pipeline.js';
 import { DEFAULT_POLICY } from '../src/viero/config/policy.js';
+import { getChain } from '../src/viero/config/chains.js';
 import {
   contextFromRetrievedCandidate,
   type AnalysisContext,
@@ -38,6 +39,7 @@ import { type LivePosition } from '../src/viero/execution/liveState.js';
 import { demoObservations } from '../src/viero/fixtures/demo.js';
 import { contractRequestToTransactionRequest, decodeIncomingErc20Transfers, inspectCloseLiquidity, reconcileClosedWithoutReceipt } from '../src/viero/execution/executor.js';
 import { Agent, closeNotificationPnlPct } from '../src/viero/workers/screeningWorker.js';
+import { sqrtAtTick } from '../src/viero/screening/math.js';
 import type { Controls, Repository } from '../src/viero/storage/repositories.js';
 
 // ─── Helpers ───────────────────────────────────────────────────
@@ -364,6 +366,31 @@ test('close notification uses canonical fee-inclusive management PnL instead of 
   assert.equal(closeNotificationPnlPct(position, obs, DEFAULT_POLICY, obs.state.observedAt, -1), canonical);
 });
 
+test('FAR_ABOVE_RANGE close notification uses quote-only principal baseline when fee evidence is unavailable', () => {
+  const v4Observation = demoObservations().find(o => o.state.pool.chainId === 4663 && o.state.pool.protocol === 'v4')!;
+  const stable = getChain(v4Observation.state.pool.chainId).primaryStable;
+  const position = makeLivePosition({
+    entryPrincipalUsd: null,
+    pool: v4Observation.state.pool,
+    plan: {
+      ...makeLivePosition().plan,
+      pool: v4Observation.state.pool,
+      tickLower: -100,
+      tickUpper: 100,
+      liquidity: 1_000_000n,
+      depositAssets: [{ token: stable, amount: 1_000_000n }, { token: v4Observation.state.token0.address, amount: 0n }],
+      depositUsd: 1,
+    },
+  });
+  const observation = structuredClone(v4Observation);
+  observation.state = { ...observation.state, tick: 200, sqrtPriceX96: sqrtAtTick(200) };
+  (observation as any).feeEvidence = false;
+  (observation as any).feeUsd = null;
+  const principalOnly = managementPrincipalPnlPct(position, observation, DEFAULT_POLICY, observation.state.observedAt);
+  assert.equal(principalOnly, 0);
+  assert.equal(closeNotificationPnlPct(position, observation, DEFAULT_POLICY, observation.state.observedAt, -0.4, 'FAR_ABOVE_RANGE'), 0);
+});
+
 test('liveManagementDecision refuses claim when lifecycle cost is null (fail-closed)', () => {
   const obs = demoObservations()[0]!;
   obs.estimatedLifecycleCostUsd = null;
@@ -387,6 +414,27 @@ test('liveManagementDecision closes after the out-of-range timeout', () => {
   const decision = liveManagementDecision(position, obs, DEFAULT_POLICY, obs.state.observedAt);
   assert.equal(decision.action, 'close');
   assert.equal(decision.reason, 'OUT_OF_RANGE_TIMEOUT');
+});
+
+test('management retries canonical V4 enrichment when the first fee observation is incomplete', async () => {
+  const v4Observation = demoObservations().find(o => o.state.pool.chainId === 4663 && o.state.pool.protocol === 'v4')!;
+  const base = makeLivePosition();
+  const position = makeLivePosition({
+    pool: v4Observation.state.pool,
+    plan: { ...base.plan, pool: v4Observation.state.pool },
+    entryPrincipalUsd: 1,
+  });
+  const incomplete = structuredClone(v4Observation) as typeof v4Observation & { feeEvidence?: boolean; feeUsd?: number | null };
+  incomplete.feeEvidence = false; incomplete.feeUsd = null;
+  const recovered = structuredClone(v4Observation) as typeof v4Observation & { feeEvidence?: boolean; feeUsd?: number | null };
+  recovered.feeEvidence = true; recovered.feeUsd = 10;
+  const repo = {} as Repository;
+  const agent = new Agent(DEFAULT_POLICY, repo, undefined, undefined);
+  (agent as any).observePositionLightweight = async () => incomplete;
+  (agent as any).enrichV4Position = async () => ({ observation: recovered });
+  const observation = await (agent as any).observeManagementPosition(position, v4Observation.state.observedAt);
+  assert.equal((observation as any).feeEvidence, true);
+  assert.equal((observation as any).feeUsd, 10);
 });
 
 // ─── LiveExecutor PnL decoding ────────────────────────────────

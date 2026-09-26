@@ -172,6 +172,16 @@ export class LiveExecutor {
     const policy = this.policy;
     const t0 = observation.state.token0;
     const t1 = observation.state.token1;
+    // Older quote-only positions may not have the post-mint entryPrincipalUsd
+    // baseline. Their persisted transfer budget is not a reliable realized
+    // cost basis (the mint can consume less), so a receipt delta must not be
+    // classified as a loss or used to blacklist the token. New positions have
+    // entryPrincipalUsd and retain exact receipt accounting.
+    const primaryStable = getChain(position.chainId).primaryStable.toLowerCase();
+    const deposited = position.plan.depositAssets.filter(asset => asset.amount > 0n);
+    const legacyQuoteOnly = position.entryPrincipalUsd == null && deposited.length > 0
+      && deposited.every(asset => asset.token.toLowerCase() === primaryStable);
+    if (legacyQuoteOnly) return null;
     const received = this.decodeIncomingTransfers(receipt, this.wallets.account.address);
     const amount0Received = received.get(t0.address.toLowerCase()) ?? 0n;
     const amount1Received = received.get(t1.address.toLowerCase()) ?? 0n;

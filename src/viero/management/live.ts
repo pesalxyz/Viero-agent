@@ -15,6 +15,48 @@ export function normalizeHumanRange(boundaryA: number, boundaryB: number): { low
   return { lower: Math.min(boundaryA, boundaryB), upper: Math.max(boundaryA, boundaryB) };
 }
 
+/**
+ * Calculate the current principal without requiring a price for a zero-sized
+ * side of an out-of-range position.  This is intentionally separate from
+ * fee-inclusive management PnL: FAR_ABOVE_RANGE is a range rule and still
+ * needs a truthful principal-only close value when fee evidence is missing.
+ */
+export function managementPrincipalValue(
+  position: LivePosition,
+  observation: Observation,
+  policy: Policy,
+  now: number,
+): { amount0: bigint; amount1: bigint; valueUsd: number; depositUsd: number | null } | null {
+  const state = observation.state;
+  const price0 = canonicalPrice(observation.prices, state.token0.address, now, policy);
+  const price1 = canonicalPrice(observation.prices, state.token1.address, now, policy);
+  const lower = sqrtAtTick(position.plan.tickLower), upper = sqrtAtTick(position.plan.tickUpper);
+  const current = state.sqrtPriceX96 < lower ? lower : state.sqrtPriceX96 > upper ? upper : state.sqrtPriceX96;
+  const amount0 = amount0Delta(current, upper, position.plan.liquidity);
+  const amount1 = amount1Delta(lower, current, position.plan.liquidity);
+  if ((amount0 > 0n && !price0) || (amount1 > 0n && !price1)) return null;
+  const valueUsd = tokenValue(amount0, state.token0.decimals, price0?.usd ?? 0)
+    + tokenValue(amount1, state.token1.decimals, price1?.usd ?? 0);
+  if (!Number.isFinite(valueUsd)) return null;
+  const depositUsd = effectivePnlDepositUsd({
+    persistedDepositUsd: position.plan.depositUsd,
+    entryPrincipalUsd: position.entryPrincipalUsd,
+    principalValueUsd: valueUsd,
+    token0Address: state.token0.address,
+    token1Address: state.token1.address,
+    amount0,
+    amount1,
+    primaryStable: getChain(position.chainId).primaryStable,
+  });
+  return { amount0, amount1, valueUsd, depositUsd };
+}
+
+/** Principal-only PnL fallback for range exits when fee evidence is absent. */
+export function managementPrincipalPnlPct(position: LivePosition, observation: Observation, policy: Policy, now: number): number | null {
+  const principal = managementPrincipalValue(position, observation, policy, now);
+  return principal ? pnlPctFromValues(principal.valueUsd, principal.depositUsd) : null;
+}
+
 /** Canonical fee-inclusive management PnL, expressed in percentage points. */
 export function managementPnlPct(position: LivePosition, observation: Observation, policy: Policy, now: number): number | null {
   const state = observation.state;
@@ -23,14 +65,9 @@ export function managementPnlPct(position: LivePosition, observation: Observatio
   const feeEvidence = position.pool.protocol !== 'v4' || (observation as Observation & { feeEvidence?: boolean }).feeEvidence === true;
   const unclaimedFeesUsd = (observation as Observation & { feeUsd?: number | null }).feeUsd ?? null;
   if (!price0 || !price1 || !(position.plan.depositUsd > 0) || !feeEvidence || (position.pool.protocol === 'v4' && unclaimedFeesUsd === null)) return null;
-  const lower = sqrtAtTick(position.plan.tickLower), upper = sqrtAtTick(position.plan.tickUpper);
-  const current = state.sqrtPriceX96 < lower ? lower : state.sqrtPriceX96 > upper ? upper : state.sqrtPriceX96;
-  const principalValueUsd = tokenValue(amount0Delta(current, upper, position.plan.liquidity), state.token0.decimals, price0.usd)
-    + tokenValue(amount1Delta(lower, current, position.plan.liquidity), state.token1.decimals, price1.usd);
-  const depositUsd = effectivePnlDepositUsd({ persistedDepositUsd: position.plan.depositUsd, entryPrincipalUsd: position.entryPrincipalUsd, principalValueUsd,
-    token0Address: state.token0.address, token1Address: state.token1.address, amount0: amount0Delta(current, upper, position.plan.liquidity),
-    amount1: amount1Delta(lower, current, position.plan.liquidity), primaryStable: getChain(position.chainId).primaryStable });
-  return pnlPctFromValues(principalValueUsd + (unclaimedFeesUsd ?? 0), depositUsd);
+  const principal = managementPrincipalValue(position, observation, policy, now);
+  if (!principal) return null;
+  return pnlPctFromValues(principal.valueUsd + (unclaimedFeesUsd ?? 0), principal.depositUsd);
 }
 
 export function liveManagementDecision(
