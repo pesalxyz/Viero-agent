@@ -19,7 +19,7 @@ Viero is an operator-controlled concentrated-liquidity agent for EVM networks. I
 - Telegram controls and cycle/position reports
 - atomic file repositories or PostgreSQL persistence
 
-The included chain configuration covers Robinhood Chain (`4663`), BNB Smart Chain (`56`), Base (`8453`), and Arc (`5042`). You must supply an RPC endpoint for every enabled chain.
+The included chain configuration covers Robinhood Chain (`4663`), BNB Smart Chain (`56`), Base (`8453`), and Arc (`5042`). Only enabled chains need RPC endpoints; a Robinhood-only setup needs only `VIERO_RPC_4663`.
 
 ## Prerequisites
 
@@ -59,63 +59,36 @@ node build/viero/cli.js preflight --chains "${VIERO_CHAINS:-4663}" --config "${V
 
 ## Configuration
 
-Copy `.env.example` to `.env`. `.env` is ignored by Git; `.env.example` contains no credentials or usable RPC endpoints.
+Copy `.env.example` to `.env`. `.env` is ignored by Git and `.env.example` contains only empty placeholders. The short Robinhood-only setup below is enough for deterministic watch-mode operation:
 
-### Required for discovery/runtime
+```sh
+cp .env.example .env
+# Set GMGN_API_KEY and VIERO_RPC_4663 in .env.
+npm run build
+VIERO_MODE=watch ./deploy/run-agent.sh
+```
 
-| Variable | Purpose |
-| --- | --- |
-| `GMGN_API_KEY` | Your GMGN credential. |
-| `VIERO_GMGN_BIN` | GMGN CLI executable; defaults to `gmgn-cli`. |
-| `VIERO_RPC_4663` | Robinhood Chain RPC URL, or comma-separated fallback URLs. |
-| `VIERO_RPC_56` | BNB Smart Chain RPC URL(s), if chain 56 is enabled. |
-| `VIERO_RPC_8453` | Base RPC URL(s), if chain 8453 is enabled. |
-| `VIERO_RPC_5042` | Arc RPC URL(s), if chain 5042 is enabled. |
-| `VIERO_CHAINS` | Comma-separated enabled chain IDs. |
-| `VIERO_CONFIG` | Strategy policy file; defaults to `config/viero.paper.json`. |
-| `VIERO_MODE` | `watch` for no live execution or `live` for the execution-capable loop. |
-| `VIERO_DATA_DIR` | File-state directory when `DATABASE_URL` is not used. |
+Configuration is grouped by when it is needed. The complete reference is in [docs/configuration.md](docs/configuration.md).
 
-### Execution and signer
+### 1. Required
 
-| Variable | Purpose |
-| --- | --- |
-| `VIERO_EXECUTION_ENABLED` | Must be `true` in both agent and signer environments for live execution. |
-| `VIERO_SIGNER_SOCKET` | Unix socket shared by agent and signer. |
-| `VIERO_SIGNER_PRIVATE_KEY` | Dedicated signer wallet key. Put it only in the protected signer environment. |
-| `VIERO_SIGNER_TX_JOURNAL` | Signer transaction journal path. |
-| `RELAY_API_KEY` | Your Relay key for optional post-close normalization. Put it only in the signer environment. |
+For Robinhood Chain (`4663`), provide `GMGN_API_KEY` and `VIERO_RPC_4663`. Keep `VIERO_CHAINS=4663`, `VIERO_MODE=watch`, and `VIERO_EXECUTION_ENABLED=false` for the safe default. Other chain RPCs are not required unless those chains are enabled.
 
-### Telegram
+### 2. Live execution
 
-| Variable | Purpose |
-| --- | --- |
-| `TELEGRAM_BOT_TOKEN` | Bot token obtained from BotFather. |
-| `TELEGRAM_USER_IDS` | Comma-separated Telegram numeric user IDs allowed to operate the bot. |
+Live trading additionally requires the protected signer environment, a dedicated wallet key, `VIERO_EXECUTION_ENABLED=true` in both agent and signer environments, and a funded signer wallet. Never put `VIERO_SIGNER_PRIVATE_KEY` in the agent `.env`. Relay is not needed to open or close liquidity; it is only needed for optional post-close normalization swaps.
 
-### Optional/runtime controls
+### 3. Optional features
 
-| Variable | Purpose |
-| --- | --- |
-| `DATABASE_URL` | PostgreSQL runtime repository URL. Omit to use atomic files. |
-| `TEST_DATABASE_URL` | PostgreSQL URL used by database tests. |
-| `VIERO_TOKEN_LIMIT` | Maximum non-blocked discovery rows retained per cycle. |
-| `VIERO_POOL_LIMIT` | Pool shortlist limit. |
-| `VIERO_TOKEN_MEMORY_PATH` | Override token-memory file location. |
-| `VIERO_BLOCKED_TOKENS_PATH` | Override blocked-token registry file location. |
-| `VIERO_SKIP_GMGN_PREFLIGHT` | Operator-only preflight override used by the Telegram service. |
-| `VIERO_LLM_ENABLED` | Enable optional LLM analysis. Deterministic gates do not depend on it. |
-| `VIERO_LLM_BASE_URL` | Optional OpenAI-compatible API base URL. |
-| `VIERO_LLM_API_KEY` | Optional LLM provider credential. |
-| `VIERO_LLM_MODEL` | Default optional analysis model. |
-| `VIERO_LLM_MODEL_SCREENER` | Optional screener model override. |
-| `VIERO_LLM_MODEL_MANAGER` | Optional manager model override. |
-| `VIERO_LLM_MODEL_GENERAL` | Optional general model override. |
-| `VIERO_LLM_TEMPERATURE` | Optional model temperature. |
-| `VIERO_LLM_MAX_TOKENS` | Optional model response limit. |
-| `VIERO_LLM_TIMEOUT_MS` | Optional model request timeout. |
+Telegram, PostgreSQL, Relay normalization, additional chains, and operator overrides are optional. File persistence is the default when `DATABASE_URL` is unset. The legacy indexer is not required and the production installer keeps it stopped and disabled.
 
-The repository also contains legacy optional indexer variables for development. The production installer deliberately keeps `viero-indexer.service` stopped and disabled; normal token-first discovery and position management do not require it.
+### 4. Optional LLM
+
+All `VIERO_LLM_*` variables are optional. Deterministic discovery, screening, ranking, planning, and management do not require an LLM.
+
+### 5. Advanced configuration
+
+Variables with safe defaults include token/pool limits, data paths, policy-file selection, signer socket paths, LLM tuning, and indexer development settings. Change them only when you understand the operational effect; see [docs/configuration.md](docs/configuration.md).
 
 ## Local operation
 
