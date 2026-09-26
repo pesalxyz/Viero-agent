@@ -331,9 +331,14 @@ test('separate MCP server exposes read-only agent tools, never upstream transact
 });
 test('PostgreSQL persists a complete run transactionally', { skip: !process.env.TEST_DATABASE_URL }, async () => {
   const repo = new PostgresRepository(process.env.TEST_DATABASE_URL!);
+  const dir = await mkdtemp(join(tmpdir(), 'viero-pg-test-'));
   try {
-    await repo.initialize(); const run = await new Agent(policy, repo).cycle({ mode: 'replay', observations: demoObservations(), now });
+    await repo.initialize();
+    const agent = new Agent(policy, repo);
+    Object.defineProperty(agent.tokenMemory, 'path', { value: join(dir, 'token-memory.json') });
+    const run = await agent.cycle({ mode: 'replay', observations: demoObservations(), now });
     assert.ok((await repo.history()).some(r => r.id === run.id));
-    assert.equal(run.candidates.length, 9);
-  } finally { await repo.close(); }
+    assert.equal(run.observations.length, 9);
+    assert.equal(run.candidates.length, 0);
+  } finally { await repo.close(); await rm(dir, { recursive: true, force: true }); }
 });
