@@ -28,4 +28,8 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm audit --omit=dev
-      - run: node build/viero/cli.js demo --out data/viero/demo-report.md
+      - name: Run offline demo smoke test
+        env:
+          VIERO_TOKEN_MEMORY_PATH: ${{ runner.temp }}/viero-token-memory.json
+          VIERO_BLOCKED_TOKENS_PATH: ${{ runner.temp }}/viero-blocked-tokens.json
+        run: node build/viero/cli.js demo --out data/viero/demo-report.md
