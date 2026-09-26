@@ -120,7 +120,7 @@ test('AUTO modes persist and are accepted by Phase 2 start validation', async ()
   await callback(bot, 'settings:auto_size'); await callback(bot, 'settings:auto_range');
   assert.equal(state.controls.sizeMode, 'AUTO'); assert.equal(state.controls.rangeMode, 'AUTO');
   assert.deepEqual(validateStartSettings(state.controls), []);
-  assert.match(sent.join('\n'), /Phase 3/);
+  assert.match(sent.join('\n'), /Deterministic market-cap\/volatility rules/);
 });
 
 test('chain menu supports multi-select and /start rejects zero enabled chains', async () => {
