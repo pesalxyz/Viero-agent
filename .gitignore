@@ -1,0 +1,80 @@
+# dependencies
+node_modules/
+
+# output
+out/
+dist/
+*.tgz
+
+# code coverage
+coverage
+*.lcov
+
+# logs
+logs/
+*.log
+*.log.*
+_.log
+report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
+
+# caches
+.eslintcache
+.cache
+*.tsbuildinfo
+
+# IntelliJ based IDEs
+.idea
+
+# Context
+mcp-context/
+build/
+
+# Finder (MacOS) folder config
+.DS_Store
+
+# Local credentials. Examples are intentionally tracked.
+.env
+.env.*
+!.env.example
+!**/*.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.mnemonic
+wallet*.json
+*wallet*.json
+private-key*.json
+*private-key*.json
+secrets/
+credentials/
+
+# Viero runtime state and databases
+data/
+runtime/
+state/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+transactions.jsonl
+*.journal
+token-memory.json
+blocked-tokens.json
+robinhood-stock-tokens.json
+
+# Backups and deployment artifacts
+backup/
+backups/
+*.bak
+*.backup
+*.old
+*.orig
+*.swp
+*.tmp
+*.pid
+*.sock
+/releases/

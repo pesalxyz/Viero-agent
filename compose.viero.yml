@@ -1,0 +1,18 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: viero
+      POSTGRES_PASSWORD: viero
+      POSTGRES_DB: viero
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - viero_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U viero"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+volumes:
+  viero_pg:

@@ -1,0 +1,11 @@
+{
+  "enabledChains": [4663, 56, 8453, 5042],
+  "windowMinutes": 30,
+  "screeningIntervalSeconds": 300,
+  "managementIntervalSeconds": 180,
+  "maximumDataAgeSeconds": 180,
+  "maximumExposureUsd": 500,
+  "maximumDailyLossUsd": 50,
+  "maximumPositionUsd": 25,
+  "maximumSlippageBps": 50
+}

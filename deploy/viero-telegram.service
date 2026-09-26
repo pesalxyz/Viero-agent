@@ -1,0 +1,61 @@
+[Unit]
+Description=Viero Telegram operator bot (operator / report surface)
+Documentation=file:/opt/viero/current/docs/deployment.md
+# Telegram is a read-only operator / report interface. It must NOT
+# trigger GMGN discovery or authenticated GMGN checks at startup, and
+# it must NOT depend on viero-indexer. Token-first targeted RPC
+# enrichment is the runtime path; the indexer is optional and
+# independently startable.
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=viero
+Group=viero
+WorkingDirectory=/opt/viero/current
+Environment=NODE_ENV=production
+Environment=HOME=/var/lib/viero
+# Skip GMGN discovery / authenticated GMGN checks during preflight.
+# Telegram must not query GMGN at startup.
+Environment=VIERO_SKIP_GMGN_PREFLIGHT=1
+EnvironmentFile=/etc/viero/viero.env
+ExecStartPre=/opt/viero/current/deploy/run-agent.sh preflight
+ExecStart=/opt/viero/current/deploy/run-agent.sh telegram
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=300
+TimeoutStopSec=30
+KillSignal=SIGTERM
+UMask=0077
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/viero
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+
+StateDirectory=viero
+StateDirectoryMode=0700
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=viero-telegram
+
+[Install]
+WantedBy=multi-user.target

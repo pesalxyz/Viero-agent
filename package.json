@@ -1,0 +1,74 @@
+{
+  "name": "viero-agent",
+  "module": "src/viero/cli.ts",
+  "type": "module",
+  "version": "2.0.4",
+  "description": "Deterministic concentrated-liquidity discovery, execution, and position-management agent",
+  "private": true,
+  "main": "build/viero/cli.js",
+  "files": [
+    "build/",
+    "bin/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "tsx src/viero/cli.ts",
+    "build": "node scripts/build.mjs",
+    "dev": "tsx --watch src/viero/cli.ts",
+    "agent": "tsx src/viero/cli.ts",
+    "agent:demo": "tsx src/viero/cli.ts demo",
+    "agent:telegram": "tsx src/viero/cli.ts telegram",
+    "agent:mcp": "tsx src/viero/mcp.ts",
+    "agent:indexer": "tsx src/viero/indexer/server.ts",
+    "agent:preflight": "node build/viero/cli.js preflight",
+    "agent:prod": "node build/viero/cli.js watch",
+    "release:viero": "bash deploy/package-release.sh",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.23.1",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.23.13"
+  },
+  "peerDependencies": {
+    "typescript": "^5.8.2"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.22.0",
+    "@pancakeswap/v3-sdk": "3.9.3",
+    "@relayprotocol/relay-sdk": "^8.0.1",
+    "express": "^4.21.2",
+    "pg": "^8.23.0",
+    "viem": "^2.39.3",
+    "zod": "^3.24.3"
+  },
+  "keywords": [
+    "evm",
+    "blockchain",
+    "ethereum",
+    "web3",
+    "smart-contracts",
+    "liquidity",
+    "uniswap",
+    "agent"
+  ],
+  "author": "pesalxyz",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pesalxyz/Viero-agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pesalxyz/Viero-agent/issues"
+  },
+  "homepage": "https://github.com/pesalxyz/Viero-agent#readme"
+}
