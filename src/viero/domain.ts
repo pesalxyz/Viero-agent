@@ -106,3 +106,21 @@ export function errorMessage(error: unknown): string {
   return (message + suffix)
     .replace(/https?:\/\/\S+/g, '[provider-url]').replace(/0x[0-9a-fA-F]{64}/g, '[hash]').slice(0, 240);
 }
+
+/** Decode the V4 PositionManager error that is otherwise hidden by viem's
+ * generic "modifyLiquidities reverted" message. */
+export function structuredExecutionError(error: unknown): { message: string; code?: string; details?: { maximumRaw?: string; requiredRaw?: string } } {
+  let candidate = error && typeof error === 'object' ? error as Record<string, unknown> : {};
+  let raw: string | undefined;
+  for (let i = 0; i < 4 && candidate; i++) {
+    raw = typeof candidate.raw === 'string' ? candidate.raw : typeof candidate.data === 'string' ? candidate.data : undefined;
+    if (raw) break;
+    candidate = candidate.cause && typeof candidate.cause === 'object' ? candidate.cause as Record<string, unknown> : {};
+  }
+  if (raw?.toLowerCase().startsWith('0x31e30ad0') && raw.length >= 138) {
+    const maximumRaw = BigInt(`0x${raw.slice(10, 74)}`).toString();
+    const requiredRaw = BigInt(`0x${raw.slice(74, 138)}`).toString();
+    return { message: `MAXIMUM_AMOUNT_EXCEEDED: maximum ${maximumRaw}, required ${requiredRaw}`, code: 'MAXIMUM_AMOUNT_EXCEEDED', details: { maximumRaw, requiredRaw } };
+  }
+  return { message: errorMessage(error) };
+}

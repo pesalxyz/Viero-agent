@@ -30,10 +30,10 @@ function llm(content: string | null, fail?: Error): LlmClient & { requests: Chat
   };
 }
 
-test('FIXED size returns persisted USD value without LLM', async () => {
+test('FIXED size returns persisted quote-token amount without LLM', async () => {
   const client = llm('{"sizeUsd":1,"reason":"unused"}');
   const result = await resolvePositionSize({ controls: controls(), context: { walletEquityUsd: null, availableExecutionBalanceUsd: null, marketCapUsd: null }, llm: client });
-  assert.deepEqual(result, { ok: true, value: 25, source: 'FIXED', reason: 'Operator-configured fixed USD size' });
+  assert.deepEqual(result, { ok: true, value: 25, source: 'FIXED', reason: 'Operator-configured fixed quote-token amount' });
   assert.equal(client.requests.length, 0);
 });
 

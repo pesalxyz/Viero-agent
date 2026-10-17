@@ -1,22 +1,30 @@
-import { erc20Abi, zeroAddress, type PublicClient, type Address } from 'viem';
+import { erc20Abi, keccak256, zeroAddress, type PublicClient, type Address, type Hex } from 'viem';
 import { getChain } from '../config/chains.js';
 import { assertChain, requireCode } from '../clients/publicClients.js';
 import { poolSchema, poolId, stateSchema, tokenSchema, type PoolRef, type PoolState, type InitializedTick } from '../domain.js';
 import { factoryAbi, v3Abi, stateViewAbi } from './abi.js';
 import { onePercentDepthRange } from '../screening/math.js';
+import { defaultEvidenceCache, type EvidenceCache } from '../storage/evidenceCache.js';
 
-export async function readToken(client: PublicClient, chainId: PoolRef['chainId'], address: Address, blockNumber: bigint) {
+export async function readToken(client: PublicClient, chainId: PoolRef['chainId'], address: Address, blockNumber: bigint, bytecodeHash?: Hex, cache: EvidenceCache = defaultEvidenceCache, blockHash = '') {
   if (address === zeroAddress) {
     const c = getChain(chainId);
     return tokenSchema.parse({ chainId, address, symbol: c.native.symbol, decimals: 18 });
+  }
+  if (bytecodeHash) {
+    const cached = await cache.token(chainId, address, bytecodeHash, blockNumber, blockHash);
+    if (cached) return tokenSchema.parse({ chainId, address, symbol: cached.symbol, decimals: cached.decimals });
   }
   const [decimals, symbol] = await Promise.all([
     client.readContract({ address, abi: erc20Abi, functionName: 'decimals', blockNumber }),
     client.readContract({ address, abi: erc20Abi, functionName: 'symbol', blockNumber }).catch(() => 'UNKNOWN'),
   ]);
-  return tokenSchema.parse({ chainId, address, decimals, symbol });
+  const result = tokenSchema.parse({ chainId, address, decimals, symbol });
+  if (bytecodeHash) await cache.putToken({ chainId, address, bytecodeHash, decimals, symbol, verifiedAtBlock: blockNumber.toString(), verifiedAtBlockHash: blockHash });
+  return result;
 }
-export async function verifyPool(client: PublicClient, input: PoolRef, atBlock?: bigint): Promise<PoolState> {
+export async function verifyPool(client: PublicClient, input: PoolRef, atBlock?: bigint, cache: EvidenceCache = defaultEvidenceCache,
+  options: { allowEmptyActiveLiquidity?: boolean } = {}): Promise<PoolState> {
   const pool = poolSchema.parse(input), c = getChain(pool.chainId);
   await assertChain(client, pool.chainId);
   const head = atBlock ?? await client.getBlockNumber({ cacheTime: 0 });
@@ -60,9 +68,16 @@ export async function verifyPool(client: PublicClient, input: PoolRef, atBlock?:
     if (!dynamicFee && key.fee !== fee) throw new Error('V4_FEE_MISMATCH');
     verification.push('pool-id', 'pool-manager-bytecode', 'state-view-bytecode', 'hook-allowlist');
   }
-  if (sqrtPriceX96 === 0n || liquidity === 0n) throw new Error('UNINITIALIZED_OR_EMPTY_POOL');
+  if (sqrtPriceX96 === 0n || (liquidity === 0n && !options.allowEmptyActiveLiquidity)) throw new Error('UNINITIALIZED_OR_EMPTY_POOL');
   if (BigInt(token0) >= BigInt(token1)) throw new Error('TOKEN_ORDER_MISMATCH');
-  const [t0, t1] = await Promise.all([readToken(client, pool.chainId, token0, blockNumber), readToken(client, pool.chainId, token1, blockNumber)]);
+  const [tokenCode0, tokenCode1] = await Promise.all([
+    token0 === zeroAddress ? Promise.resolve(null) : requireCode(client, token0, blockNumber),
+    token1 === zeroAddress ? Promise.resolve(null) : requireCode(client, token1, blockNumber),
+  ]);
+  const [t0, t1] = await Promise.all([
+    readToken(client, pool.chainId, token0, blockNumber, tokenCode0 ? keccak256(tokenCode0) : undefined, cache, block.hash),
+    readToken(client, pool.chainId, token1, blockNumber, tokenCode1 ? keccak256(tokenCode1) : undefined, cache, block.hash),
+  ]);
   return stateSchema.parse({ pool, token0: t0, token1: t1, blockNumber, blockHash: block.hash,
     observedAt: Number(block.timestamp), fetchedAt: Date.now() / 1000, sqrtPriceX96, tick, tickSpacing, liquidity, fee, protocolFee,
     dynamicFee, verified: true, verification });

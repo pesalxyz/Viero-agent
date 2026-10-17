@@ -10,6 +10,7 @@ StartLimitBurst=3
 Type=simple
 User=viero-signer
 Group=viero
+SupplementaryGroups=viero-signer
 WorkingDirectory=/opt/viero/current
 Environment=NODE_ENV=production
 Environment=HOME=/var/lib/viero-signer

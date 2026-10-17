@@ -35,6 +35,7 @@ export const erc20ExecutionAbi = parseAbi([
   'function allowance(address,address) view returns (uint256)',
   'function approve(address,uint256) returns (bool)',
 ]);
+export const wrappedNativeAbi = parseAbi(['function deposit() payable']);
 export const erc20TransferEvent = parseAbiItem('event Transfer(address indexed from,address indexed to,uint256 value)');
 export const permit2Abi = parseAbi([
   'function allowance(address,address,address) view returns (uint160 amount,uint48 expiration,uint48 nonce)',

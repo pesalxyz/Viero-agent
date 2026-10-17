@@ -5,12 +5,16 @@ import { pancakeV3SwapEvent, stateViewAbi, v3Abi, v3ProtocolFeeEvent, v3SwapEven
 import { readDepthTicks } from './pools.js';
 import { spotPrice, tokenValue } from '../screening/math.js';
 import { swapFeeUsd } from '../indexer/fees.js';
+import { defaultEvidenceCache, type EvidenceCache } from '../storage/evidenceCache.js';
+import { defaultRpcTelemetry, type RpcTelemetry } from '../observability/rpcTelemetry.js';
 
 // Subdivide capped responses as well as RPC errors. A capped single block is an error, never a partial success.
-export async function pagedLogs<T>(from: bigint, to: bigint, read: (from: bigint, to: bigint) => Promise<T[]>, pageSize = 1000n, rowCap = 1000): Promise<T[]> {
+export type PagedLogsOptions = { chainId?: number; telemetry?: RpcTelemetry };
+export async function pagedLogs<T>(from: bigint, to: bigint, read: (from: bigint, to: bigint) => Promise<T[]>, pageSize = 1000n, rowCap = 1000, options: PagedLogsOptions = {}): Promise<T[]> {
   if (from < 0n || to < from || pageSize < 1n || rowCap < 1) throw new Error('Invalid log range');
   const result: T[] = [];
   const pending: Array<{ start: bigint; end: bigint }> = [];
+  let pages = 0, splits = 0, errors = 0, started = Date.now();
   for (let start = to - ((to - from) % pageSize); start >= from; start -= pageSize) {
     pending.push({ start, end: start + pageSize - 1n > to ? to : start + pageSize - 1n });
     if (start === from) break;
@@ -19,20 +23,24 @@ export async function pagedLogs<T>(from: bigint, to: bigint, read: (from: bigint
     const { start, end } = pending.pop()!;
     let rows: T[] | null = null;
     try {
+      pages += 1;
       rows = await read(start, end);
       if (rows.length < rowCap) {
         result.push(...rows);
         continue;
       }
-      if (start === end) throw new Error('LOG_ROW_CAP_AT_SINGLE_BLOCK');
+      if (start === end) { options.telemetry?.pagination(options.chainId ?? 0, from, to, pages, splits, result.length, Date.now() - started, true); throw new Error('LOG_ROW_CAP_AT_SINGLE_BLOCK'); }
     } catch (e) {
-      if (start === end || !/block range|too many|more than|limit exceeded|exceeds defined limit|response.*size|query.*limit|-32005/i.test(e instanceof Error ? e.message : String(e))) throw e;
+      errors += 1;
+      if (start === end || !/block range|too many|more than|limit exceeded|exceeds defined limit|response.*size|query.*limit|-32005/i.test(e instanceof Error ? e.message : String(e))) { options.telemetry?.pagination(options.chainId ?? 0, from, to, pages, splits, result.length, Date.now() - started, true); throw e; }
     }
     const mid = (start + end) / 2n;
+    splits += 1;
     // Stack is LIFO: push the right half first to preserve ascending order.
     pending.push({ start: mid + 1n, end });
     pending.push({ start, end: mid });
   }
+  if (options.chainId !== undefined) options.telemetry?.pagination(options.chainId, from, to, pages, splits, result.length, Date.now() - started, errors > 0);
   return result;
 }
 export async function firstBlockAt(client: PublicClient, head: bigint, timestamp: number): Promise<bigint> {
@@ -45,11 +53,85 @@ export async function firstBlockAt(client: PublicClient, head: bigint, timestamp
   return low;
 }
 
+/** Cycle-scoped exact timestamp-to-block boundary cache. The caller supplies
+ * the already pinned head hash; a changed head/hash therefore cannot hit. */
+export class BlockBoundaryCache {
+  private readonly entries = new Map<string, bigint>();
+  constructor(private readonly capacity = 128) {}
+  async get(client: PublicClient, chainId: number, head: bigint, headHash: string, timestamp: number): Promise<bigint> {
+    const key = `${chainId}:${head.toString()}:${headHash.toLowerCase()}:${timestamp}`;
+    const cached = this.entries.get(key);
+    if (cached !== undefined) { this.entries.delete(key); this.entries.set(key, cached); return cached; }
+    const value = await firstBlockAt(client, head, timestamp);
+    this.entries.set(key, value);
+    while (this.entries.size > Math.max(1, this.capacity)) this.entries.delete(this.entries.keys().next().value!);
+    return value;
+  }
+  clear(): void { this.entries.clear(); }
+  size(): number { return this.entries.size; }
+}
+
+type HistoricalMemoKind = 'block' | 'state' | 'transaction';
+
+/**
+ * Observation-local memo for equivalent historical reads.  It is deliberately
+ * not exported as a process cache: an observation owns its instance and drops
+ * it at completion (or on any reorg/error).  Entries are only keyed when the
+ * caller has a block identity; unknown identities are read directly.
+ */
+export class ObservationRpcMemo {
+  private readonly entries = new Map<string, Promise<unknown>>();
+  constructor(private readonly telemetry: RpcTelemetry = defaultRpcTelemetry, private readonly capacity = 128) {}
+
+  async read<T>(kind: HistoricalMemoKind, key: string | null, read: () => Promise<T>): Promise<T> {
+    if (key === null) return read();
+    const existing = this.entries.get(key);
+    if (existing) {
+      this.entries.delete(key);
+      this.entries.set(key, existing);
+      this.telemetry.historicalMemo(kind, 'hit');
+      this.telemetry.historicalMemoAvoided();
+      return existing as Promise<T>;
+    }
+    this.telemetry.historicalMemo(kind, 'miss');
+    const pending = read().then(value => {
+      // Nullish/incomplete historical evidence is never memoized.
+      if (value === null || value === undefined) this.entries.delete(key);
+      return value;
+    }, error => {
+      this.entries.delete(key);
+      throw error;
+    });
+    this.entries.set(key, pending);
+    while (this.entries.size > Math.max(1, this.capacity)) {
+      const oldest = this.entries.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.entries.delete(oldest);
+      this.telemetry.historicalMemoEviction();
+    }
+    return pending as Promise<T>;
+  }
+
+  invalidate(key?: string): void {
+    if (key === undefined) this.entries.clear();
+    else this.entries.delete(key);
+    this.telemetry.historicalMemoInvalidation();
+  }
+
+  size(): number { return this.entries.size; }
+}
+
 /**
  * Find the first block at which one exact pool was initialized. This is
  * O(log(head)) pinned RPC reads and never enumerates the pool universe.
  */
-export async function exactPoolCreatedAt(client: PublicClient, state: PoolState): Promise<number | null> {
+export type PoolCreationEvidence = { blockNumber: bigint; timestamp: number; blockHash: Hex | null };
+export async function exactPoolCreatedEvidence(client: PublicClient, state: PoolState, cache?: EvidenceCache): Promise<PoolCreationEvidence | null> {
+  const identity = poolIdentity(state.pool);
+  if (cache) {
+    const cached = await cache.creation(state.pool.chainId, identity, client);
+    if (cached && BigInt(cached.creationBlock) <= state.blockNumber) return { blockNumber: BigInt(cached.creationBlock), timestamp: cached.timestamp, blockHash: cached.creationBlockHash as Hex };
+  }
   const existsAt = async (blockNumber: bigint) => {
     try {
       if (state.pool.protocol === 'v3') {
@@ -75,7 +157,14 @@ export async function exactPoolCreatedAt(client: PublicClient, state: PoolState)
     if (await existsAt(mid)) high = mid;
     else low = mid + 1n;
   }
-  return Number((await client.getBlock({ blockNumber: low })).timestamp);
+  const block = await client.getBlock({ blockNumber: low });
+  const evidence = { blockNumber: low, timestamp: Number(block.timestamp), blockHash: block.hash ? block.hash as Hex : null };
+  if (cache && evidence.blockHash) await cache.putCreation({ chainId: state.pool.chainId, identity, creationBlock: low.toString(), timestamp: evidence.timestamp, creationBlockHash: evidence.blockHash, verifiedAtBlock: state.blockNumber.toString(), verifiedAtBlockHash: state.blockHash });
+  return evidence;
+}
+export async function exactPoolCreatedAt(client: PublicClient, state: PoolState): Promise<number | null> {
+  const evidence = await exactPoolCreatedEvidence(client, state);
+  return evidence?.timestamp ?? null;
 }
 
 // Conservative whole-position envelopes: open, one claim/rebalance, close.
@@ -99,18 +188,20 @@ export async function targetedRpcObservation(
   prices: Price[],
   windowMinutes: number,
   nativeUsd: number | null,
+  cache: EvidenceCache = defaultEvidenceCache,
+  boundaries?: BlockBoundaryCache,
 ): Promise<Observation> {
-  const [poolCreatedAt, lifecycleCost] = await Promise.all([
-    exactPoolCreatedAt(client, state),
+  const [poolCreated, lifecycleCost] = await Promise.all([
+    exactPoolCreatedEvidence(client, state, cache),
     estimatedLifecycleCostUsd(client, state, nativeUsd),
   ]);
-  const observation = await rpcObservation(client, state, prices, windowMinutes, poolCreatedAt);
+  const observation = await rpcObservation(client, state, prices, windowMinutes, poolCreated?.timestamp ?? null, boundaries);
   return observationSchema.parse({
     ...observation,
     estimatedLifecycleCostUsd: lifecycleCost,
     issues: [
       ...observation.issues.filter(issue => !issue.includes('lifecycle costs still require enrichment')),
-      ...(poolCreatedAt === null ? ['Exact pool creation block unavailable from bounded RPC history'] : []),
+      ...(poolCreated === null ? ['Exact pool creation block unavailable from bounded RPC history'] : []),
       ...(lifecycleCost === null ? ['Lifecycle gas cost unavailable from RPC gas price/native USD reference'] : ['Lifecycle gas cost uses a conservative protocol gas-unit envelope']),
       ...(state.pool.protocol === 'v4' ? ['V4 exact per-pool TVL unavailable from shared PoolManager balances'] : []),
     ],
@@ -121,36 +212,58 @@ export async function targetedRpcObservation(
 export function lightweightManagementObservation(state: import('../domain.js').PoolState, prices: Price[]): Observation {
   return observationSchema.parse({ state, windowStart: state.observedAt, windowEnd: state.observedAt, source: 'lightweight-management', indexedBlock: state.blockNumber, complete: true, valuation: 'window-end-reference', swaps: [], prices, risks: [], tvlUsd: null, poolCreatedAt: null, ticks: [], ticksComplete: false, positionsCreated: null, uniqueLps: null, liquidityAddedUsd: null, liquidityRemovedUsd: null, estimatedLifecycleCostUsd: null, issues: [] });
 }
-export async function rpcObservation(client: PublicClient, state: PoolState, prices: Price[], windowMinutes: number, poolCreatedAt: number | null = null): Promise<Observation> {
+export async function rpcObservation(client: PublicClient, state: PoolState, prices: Price[], windowMinutes: number, poolCreatedAt: number | null = null, boundaries?: BlockBoundaryCache, memo = new ObservationRpcMemo()): Promise<Observation> {
   const { pool, blockNumber } = state, windowEnd = state.observedAt, windowStart = windowEnd - windowMinutes * 60;
-  const from = await firstBlockAt(client, blockNumber, windowStart);
+  const from = boundaries ? await boundaries.get(client, pool.chainId, blockNumber, state.blockHash, windowStart) : await firstBlockAt(client, blockNumber, windowStart);
+  const telemetry = defaultRpcTelemetry;
   const p0 = prices.find(p => p.token === state.token0.address)?.usd, p1 = prices.find(p => p.token === state.token1.address)?.usd;
   if (!p0 || !p1) throw new Error('PRICE_UNAVAILABLE_FOR_RPC_METRICS');
   const swaps: Swap[] = [];
   const times = new Map<bigint, number>();
   const traders = new Map<Hex, Address>();
   const logs = pool.protocol === 'v4'
-    ? await pagedLogs(from, blockNumber, (fromBlock, toBlock) => client.getLogs({ address: getChain(pool.chainId).v4.poolManager, event: v4SwapEvent, args: { id: pool.poolId }, strict: true, fromBlock, toBlock }))
+    ? await pagedLogs(from, blockNumber, (fromBlock, toBlock) => client.getLogs({ address: getChain(pool.chainId).v4.poolManager, event: v4SwapEvent, args: { id: pool.poolId }, strict: true, fromBlock, toBlock }), 1000n, 1000, { chainId: pool.chainId, telemetry })
     : pool.dex === 'pancakeswap'
-      ? await pagedLogs(from, blockNumber, (fromBlock, toBlock) => client.getLogs({ address: pool.poolAddress, event: pancakeV3SwapEvent, strict: true, fromBlock, toBlock }))
-      : await pagedLogs(from, blockNumber, (fromBlock, toBlock) => client.getLogs({ address: pool.poolAddress, event: v3SwapEvent, strict: true, fromBlock, toBlock }));
+      ? await pagedLogs(from, blockNumber, (fromBlock, toBlock) => client.getLogs({ address: pool.poolAddress, event: pancakeV3SwapEvent, strict: true, fromBlock, toBlock }), 1000n, 1000, { chainId: pool.chainId, telemetry })
+      : await pagedLogs(from, blockNumber, (fromBlock, toBlock) => client.getLogs({ address: pool.poolAddress, event: v3SwapEvent, strict: true, fromBlock, toBlock }), 1000n, 1000, { chainId: pool.chainId, telemetry });
   const protocolUpdates = pool.protocol === 'v4'
-    ? await pagedLogs(from, blockNumber, (fromBlock, toBlock) => client.getLogs({ address: getChain(pool.chainId).v4.poolManager, event: v4ProtocolFeeEvent, args: { id: pool.poolId }, strict: true, fromBlock, toBlock }))
+    ? await pagedLogs(from, blockNumber, (fromBlock, toBlock) => client.getLogs({ address: getChain(pool.chainId).v4.poolManager, event: v4ProtocolFeeEvent, args: { id: pool.poolId }, strict: true, fromBlock, toBlock }), 1000n, 1000, { chainId: pool.chainId, telemetry })
     : pool.dex === 'uniswap'
-      ? await pagedLogs(from, blockNumber, (fromBlock, toBlock) => client.getLogs({ address: pool.poolAddress, event: v3ProtocolFeeEvent, strict: true, fromBlock, toBlock }))
+      ? await pagedLogs(from, blockNumber, (fromBlock, toBlock) => client.getLogs({ address: pool.poolAddress, event: v3ProtocolFeeEvent, strict: true, fromBlock, toBlock }), 1000n, 1000, { chainId: pool.chainId, telemetry })
       : [];
   const protocolFees = new Map<bigint, number>();
+  const eventBlockHashes = new Map<bigint, Hex>();
+  for (const log of logs) {
+    if (log.blockNumber !== null && log.blockHash) {
+      const previous = eventBlockHashes.get(log.blockNumber);
+      if (previous && previous.toLowerCase() !== log.blockHash.toLowerCase()) throw new Error('REORG_DURING_OBSERVATION');
+      eventBlockHashes.set(log.blockNumber, log.blockHash);
+    }
+  }
   const eventBlocks = [...new Set(logs.map(log => log.blockNumber))].filter((n): n is bigint => n !== null);
   const reads: Array<() => Promise<void>> = [
-    ...eventBlocks.map(n => async () => { times.set(n, Number((await client.getBlock({ blockNumber: n })).timestamp)); }),
+    ...eventBlocks.map(n => async () => {
+      const expectedHash = eventBlockHashes.get(n) ?? null;
+      const block = await memo.read('block', expectedHash ? `block:${pool.chainId}:${n}:${expectedHash.toLowerCase()}` : null, () => client.getBlock({ blockNumber: n }));
+      if (expectedHash && block.hash && block.hash.toLowerCase() !== expectedHash.toLowerCase()) { memo.invalidate(); throw new Error('REORG_DURING_OBSERVATION'); }
+      times.set(n, Number(block.timestamp));
+    }),
     ...eventBlocks.map(n => async () => {
       const before = n > 0n ? n - 1n : n;
-      const slot = pool.protocol === 'v3'
-        ? await client.readContract({ address: pool.poolAddress, abi: v3Abi, functionName: 'slot0', blockNumber: before })
-        : await client.readContract({ address: getChain(pool.chainId).v4.stateView, abi: stateViewAbi, functionName: 'getSlot0', args: [pool.poolId], blockNumber: before });
+      const expectedHash = eventBlockHashes.get(n) ?? null;
+      const stateKey = expectedHash ? `state:${pool.chainId}:${pool.protocol === 'v3' ? pool.poolAddress : getChain(pool.chainId).v4.stateView}:${pool.protocol === 'v3' ? 'slot0' : `getSlot0:${pool.poolId}`}:${before}:${expectedHash.toLowerCase()}` : null;
+      const slot = await memo.read<any>('state', stateKey, () => pool.protocol === 'v3'
+        ? client.readContract({ address: pool.poolAddress, abi: v3Abi, functionName: 'slot0', blockNumber: before })
+        : client.readContract({ address: getChain(pool.chainId).v4.stateView, abi: stateViewAbi, functionName: 'getSlot0', args: [pool.poolId], blockNumber: before }));
       protocolFees.set(n, pool.protocol === 'v3' ? slot[5]! : slot[2]!);
     }),
-    ...[...new Set(logs.map(log => log.transactionHash))].filter((hash): hash is Hex => hash !== null).map(hash => async () => { traders.set(hash, (await client.getTransaction({ hash })).from.toLowerCase() as Address); }),
+    ...[...new Set(logs.map(log => log.transactionHash))].filter((hash): hash is Hex => hash !== null).map(hash => async () => {
+      const event = logs.find(log => log.transactionHash === hash);
+      const expectedHash = event?.blockNumber === null || event?.blockNumber === undefined ? null : eventBlockHashes.get(event.blockNumber) ?? null;
+      const tx = await memo.read('transaction', expectedHash ? `tx:${pool.chainId}:${hash.toLowerCase()}:${expectedHash.toLowerCase()}` : null, () => client.getTransaction({ hash }));
+      if (expectedHash && tx.blockHash && tx.blockHash.toLowerCase() !== expectedHash.toLowerCase()) { memo.invalidate(); throw new Error('REORG_DURING_OBSERVATION'); }
+      traders.set(hash, tx.from.toLowerCase() as Address);
+    }),
   ];
   for (let offset = 0; offset < reads.length; offset += 20) await Promise.all(reads.slice(offset, offset + 20).map(read => read()));
   for (const log of logs) {

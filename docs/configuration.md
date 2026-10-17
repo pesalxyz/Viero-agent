@@ -63,7 +63,10 @@ Add the chain ID to `VIERO_CHAINS` and provide its RPC variable:
 ## Optional LLM
 
 LLM analysis is optional. Deterministic discovery, economic/security screening,
-Stage-1 ranking, planning, and position management do not require an LLM.
+Stage-1 ranking, auto-size/auto-range, planning, and position management do
+not require an LLM. Live and Telegram modes can start without an LLM key;
+conversational analysis and explanations are constructed only when explicitly
+enabled and fail clearly when credentials are absent.
 
 | Variable | Default / purpose |
 | --- | --- |

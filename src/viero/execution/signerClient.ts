@@ -17,7 +17,12 @@ export class SignerClient {
         res.on('end', () => {
           try {
             const value = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { error?: string };
-            if (!res.statusCode || res.statusCode >= 300) reject(new Error(value.error ?? `SIGNER_HTTP_${res.statusCode}`)); else resolve(value);
+            if (!res.statusCode || res.statusCode >= 300) {
+              const failure = new Error(value.error ?? `SIGNER_HTTP_${res.statusCode}`) as Error & { code?: string; details?: unknown };
+              if ('code' in value) failure.code = (value as { code?: string }).code;
+              if ('details' in value) failure.details = (value as { details?: unknown }).details;
+              reject(failure);
+            } else resolve(value);
           } catch (error) { reject(error); }
         });
       });
@@ -34,6 +39,9 @@ export class SignerClient {
   async open(plan: PositionPlan, observation: Observation, policy: Policy) {
     return resultSchema.parse(await this.call('/v1/open',
       { plan: positionPlanSchema.parse(plan), observation: observationSchema.parse(observation), policy }));
+  }
+  async acknowledgePosition(transactionHash: `0x${string}`, positionId: string) {
+    return z.object({ operationId: z.string(), projectionAckAt: z.number().nullable().optional() }).passthrough().parse(await this.call('/v1/ack-position', { transactionHash, positionId }));
   }
   async claim(position: LivePosition) { return resultSchema.parse(await this.call('/v1/claim', { position: livePositionSchema.parse(position) })); }
   async close(position: LivePosition, observation: Observation, policy: Policy, emergency = false) {

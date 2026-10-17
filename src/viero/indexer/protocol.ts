@@ -6,6 +6,7 @@ import { getChain } from '../config/chains.js';
 import { chainIdSchema, hex32Schema, json, poolIdentity, poolSchema, type ChainId, type PoolRef } from '../domain.js';
 import { initializeEvent, poolCreatedEvent } from '../adapters/abi.js';
 import { pagedLogs } from '../adapters/events.js';
+import { defaultRpcTelemetry } from '../observability/rpcTelemetry.js';
 
 export const INDEX_BLOCK_CHUNK_SIZE = 50_000n;
 const CHECKPOINT_PERSIST_CHUNKS = 20;
@@ -20,7 +21,7 @@ export async function scanProtocolPools(client: PublicClient, chainId: ChainId, 
   for (const [dex, deployment] of Object.entries(chain.v3)) {
     const logs = await pagedLogs(fromBlock, toBlock, (start, end) => client.getLogs({
       address: deployment.factory, event: poolCreatedEvent, strict: true, fromBlock: start, toBlock: end,
-    }), INDEX_BLOCK_CHUNK_SIZE);
+    }), INDEX_BLOCK_CHUNK_SIZE, 1000, { chainId, telemetry: defaultRpcTelemetry });
     for (const log of logs) {
       if (log.removed) throw new Error('REORG_DURING_V3_INDEX');
       add(poolSchema.parse({ chainId, protocol: 'v3', dex, poolAddress: log.args.pool }));
@@ -28,7 +29,7 @@ export async function scanProtocolPools(client: PublicClient, chainId: ChainId, 
   }
   const v4Logs = await pagedLogs(fromBlock, toBlock, (start, end) => client.getLogs({
     address: chain.v4.poolManager, event: initializeEvent, strict: true, fromBlock: start, toBlock: end,
-  }), INDEX_BLOCK_CHUNK_SIZE);
+  }), INDEX_BLOCK_CHUNK_SIZE, 1000, { chainId, telemetry: defaultRpcTelemetry });
   for (const log of v4Logs) {
     if (log.removed) throw new Error('REORG_DURING_V4_INDEX');
     const k = log.args;

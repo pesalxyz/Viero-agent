@@ -1,0 +1,42 @@
+[
+  {
+    "chainId": 56,
+    "protocol": "v3",
+    "dex": "pancakeswap",
+    "poolAddress": "0x4f31fa980a675570939b737ebdde0471a4be40eb",
+    "token0": "0x55d398326f99059ff775485246999027b3197955",
+    "token1": "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
+    "fee": 500,
+    "externalLiquidityUsd": 40385287.87,
+    "verificationBlockNumber": "127826650",
+    "verificationBlockHash": "0x5ca993f734758102f222f117ba8e2a1181d0b1d412d6f1d977228f90aa673c8b",
+    "evidence": {
+      "source": "DEX Screener token-pairs/v1/bsc/0x55d398326f99059ff775485246999027b3197955",
+      "identityMethod": "Viero verifyPool: PancakeSwap V3 bytecode + factory getPool(token0,token1,fee)",
+      "verification": ["rpc-chain-id", "block-pinned", "factory-identity", "pool-bytecode"],
+      "note": "USDT/USDC are both configured BNB quote tokens; the pool is a supported PancakeSwap V3 identity."
+    }
+  },
+  {
+    "chainId": 4663,
+    "protocol": "v4",
+    "dex": "uniswap",
+    "poolId": "0x4be9657ec9002e528f4f17a5c43edc525a07f888f7b180c2afbf75e096c4f38a",
+    "poolKey": {
+      "currency0": "0x39dbed3a2bd333467115de45665cc57f813c4571",
+      "currency1": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+      "fee": 3000,
+      "tickSpacing": 60,
+      "hooks": "0x0000000000000000000000000000000000000000"
+    },
+    "externalLiquidityUsd": 1491292.2,
+    "verificationBlockNumber": "89403852",
+    "verificationBlockHash": "0x6173e1d305024073afa6908514b541686c3f34040b90d3faa16b1639f419560c",
+    "evidence": {
+      "source": "DEX Screener token-pairs/v1/robinhood/0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+      "identityMethod": "PositionManager.poolKeys(bytes25(poolId)) followed by Viero poolId(PoolKey) recomputation",
+      "verification": ["rpc-chain-id", "block-pinned", "pool-id", "pool-manager-bytecode", "state-view-bytecode", "hook-allowlist"],
+      "note": "The higher-liquidity first hint had a non-zero hook rejected by Viero's hook allowlist; this zero-hook candidate is the highest compatible verified hint."
+    }
+  }
+]

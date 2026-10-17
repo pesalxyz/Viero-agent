@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile, rename, readdir } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, rename, readdir, open } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { type Address } from 'viem';
@@ -44,7 +44,7 @@ export type AgentRun = {
   positions: PaperPosition[];
   livePositions?: Array<{ id: string; tokenId: string; protocol: 'v3' | 'v4'; status: 'open' | 'closing'; symbol?: string; poolAddress?: string; openedAt: number; closeReason?: string | null; valueUsd?: number | null; feeUsd?: number | null; feeDetails?: string | null; pnlPct?: number | null; inRange?: boolean; currentPrice?: number | null; lowerPrice?: number | null; upperPrice?: number | null; peakPnlPct?: number | null; trailingTakeProfitArmed?: boolean; outOfRangeSince?: number | null; baseSymbol?: string; quoteSymbol?: string }>;
   health: ProviderHealth[]; providerObservations: ProviderObservation[];
-  errors: Array<{ chainId: ChainId; pool?: string; error: string; code?: string; details?: { quoteAddress?: string; quoteSymbol?: string; quoteDecimals?: number; requiredRaw?: string; availableRaw?: string; requiredHuman?: string; availableHuman?: string; requiredUsd?: number } }>; status: 'ok' | 'degraded' | 'failed';
+  errors: Array<{ chainId: ChainId; pool?: string; error: string; code?: string; details?: { quoteAddress?: string; quoteSymbol?: string; quoteDecimals?: number; requiredRaw?: string; availableRaw?: string; requiredHuman?: string; availableHuman?: string; requiredUsd?: number; maximumRaw?: string } }>; status: 'ok' | 'degraded' | 'failed';
 };
 export const botOperatingStateSchema = z.enum(['RUNNING', 'STOPPED']);
 export type BotOperatingState = z.infer<typeof botOperatingStateSchema>;
@@ -58,6 +58,11 @@ export const controlsSchema = z.object({
   fixedRangePct: z.number().finite().min(1).max(99).nullable().default(null),
   sizeMode: strategyModeSchema.nullable().default(null),
   fixedSizeUsd: z.number().finite().positive().nullable().default(null),
+  fixedQuoteByChain: z.record(z.string(), z.enum(['NATIVE', 'STABLE'])).default({}),
+  fixedSizeByChainQuote: z.record(z.string(), z.object({
+    NATIVE: z.number().finite().positive().optional(),
+    STABLE: z.number().finite().positive().optional(),
+  }).strict()).default({}),
   enabledChains: z.array(chainIdSchema).default([]),
   takeProfitPct: z.number().finite().positive().nullable().default(null),
   stopLossPct: z.number().finite().negative().nullable().default(null),
@@ -75,6 +80,8 @@ export type Controls = {
   globalPaused: boolean; pausedChains: ChainId[]; botState?: BotOperatingState;
   rangeMode?: StrategyMode | null; fixedRangePct?: number | null;
   sizeMode?: StrategyMode | null; fixedSizeUsd?: number | null;
+  fixedQuoteByChain?: Partial<Record<ChainId, 'NATIVE' | 'STABLE'>>;
+  fixedSizeByChainQuote?: Partial<Record<ChainId, Partial<Record<'NATIVE' | 'STABLE', number>>>>;
   enabledChains?: ChainId[]; takeProfitPct?: number | null; stopLossPct?: number | null;
   minAutoSizeUsd?: number; maxAutoSizeUsd?: number; autoSizeMarketCapMinUsd?: number; autoSizeMarketCapMaxUsd?: number; maxWalletExposurePct?: number;
   minAutoRangePct?: number; maxAutoRangePct?: number; autoRangeVolatilityReferencePct?: number;
@@ -89,7 +96,11 @@ export interface Repository {
 async function atomicWrite(path: string, value: unknown) {
   const temp = `${path}.${randomUUID()}.tmp`;
   await writeFile(temp, json(value, true), { mode: 0o600 });
+  const file = await open(temp, 'r+');
+  try { await file.sync(); } finally { await file.close(); }
   await rename(temp, path);
+  const directory = await open(resolve(path, '..'), 'r');
+  try { await directory.sync(); } finally { await directory.close(); }
 }
 function hydratePlan(plan: PositionPlan): PositionPlan {
   return { ...plan, liquidity: BigInt(plan.liquidity), sourceBlock: BigInt(plan.sourceBlock),

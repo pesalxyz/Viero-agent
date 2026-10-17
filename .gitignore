@@ -6,6 +6,9 @@ out/
 dist/
 *.tgz
 
+# generated thesis artifacts
+docs/thesis/
+
 # code coverage
 coverage
 *.lcov

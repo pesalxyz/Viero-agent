@@ -61,7 +61,7 @@ export async function resolvePositionSize(input: {
   if (controls.sizeMode === 'FIXED') {
     const value = controls.fixedSizeUsd;
     return typeof value === 'number' && Number.isFinite(value) && value > 0
-      ? { ok: true, value, source: 'FIXED', reason: 'Operator-configured fixed USD size' }
+      ? { ok: true, value, source: 'FIXED', reason: 'Operator-configured fixed quote-token amount' }
       : rejected('FIXED', 'FIXED_SIZE_INVALID');
   }
   if (controls.sizeMode !== 'AUTO') return rejected('AUTO', 'SIZE_MODE_NOT_CONFIGURED');

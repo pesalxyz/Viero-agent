@@ -44,6 +44,7 @@ function botFor(repo: Repository, signer?: unknown) {
 
 const configuredControls = (): Controls => ({ globalPaused: false, pausedChains: [], botState: 'STOPPED',
   sizeMode: 'FIXED', fixedSizeUsd: 25, rangeMode: 'FIXED', fixedRangePct: 15,
+  fixedSizeByChainQuote: { 8453: { NATIVE: 0.005, STABLE: 25 } },
   enabledChains: [8453], takeProfitPct: 20, stopLossPct: -10 });
 
 async function callback(bot: TelegramBot, data: string) {
@@ -100,17 +101,23 @@ test('/settings is allowed only while STOPPED', async () => {
 });
 
 test('Fixed Size and Fixed Range validate input and persist FIXED modes', async () => {
-  const state = memoryRepo({ globalPaused: false, pausedChains: [], botState: 'STOPPED' });
+  const state = memoryRepo({ globalPaused: false, pausedChains: [], botState: 'STOPPED', enabledChains: [4663] });
   const { bot, sent } = botFor(state.repo);
   await callback(bot, 'settings:fixed_size');
+  await callback(bot, 'settings:fixed_chain:4663');
+  await callback(bot, 'settings:fixed_quote:4663:STABLE');
   await bot.handleMessage({ message_id: 1, from: { id: 7 }, chat: { id: 7 }, text: 'NaN' });
   assert.match(sent.at(-1)!, /Invalid value/);
   await bot.handleMessage({ message_id: 2, from: { id: 7 }, chat: { id: 7 }, text: '25' });
-  assert.equal(state.controls.sizeMode, 'FIXED'); assert.equal(state.controls.fixedSizeUsd, 25);
+  assert.equal(state.controls.sizeMode, 'FIXED'); assert.equal(state.controls.fixedSizeByChainQuote?.[4663]?.STABLE, 25);
+  await callback(bot, 'settings:fixed_chain:4663');
+  await callback(bot, 'settings:fixed_quote:4663:NATIVE');
+  await bot.handleMessage({ message_id: 3, from: { id: 7 }, chat: { id: 7 }, text: '0.005' });
+  assert.equal(state.controls.fixedSizeByChainQuote?.[4663]?.NATIVE, 0.005);
   await callback(bot, 'settings:fixed_range');
-  await bot.handleMessage({ message_id: 3, from: { id: 7 }, chat: { id: 7 }, text: '0' });
+  await bot.handleMessage({ message_id: 4, from: { id: 7 }, chat: { id: 7 }, text: '0' });
   assert.match(sent.at(-1)!, /1 to 99/);
-  await bot.handleMessage({ message_id: 4, from: { id: 7 }, chat: { id: 7 }, text: '99' });
+  await bot.handleMessage({ message_id: 5, from: { id: 7 }, chat: { id: 7 }, text: '99' });
   assert.equal(state.controls.rangeMode, 'FIXED'); assert.equal(state.controls.fixedRangePct, 99);
 });
 
@@ -154,7 +161,7 @@ test('TP and SL enforce signs, persist, and are mandatory for /start', async () 
 });
 
 test('/start reports missing FIXED values and remains STOPPED', async () => {
-  const state = memoryRepo({ ...configuredControls(), fixedSizeUsd: null, fixedRangePct: null });
+  const state = memoryRepo({ ...configuredControls(), fixedSizeUsd: null, fixedSizeByChainQuote: {}, fixedRangePct: null });
   const { bot, sent } = botFor(state.repo);
   await bot.handleMessage({ message_id: 1, from: { id: 7 }, chat: { id: 7 }, text: '/start' });
   assert.equal(state.controls.botState, 'STOPPED');

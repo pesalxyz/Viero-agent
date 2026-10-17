@@ -4,6 +4,7 @@ import type { LlmClient } from '../src/viero/agent/llmClient.js';
 import type { Controls, Repository, AgentRun } from '../src/viero/storage/repositories.js';
 import { assertCandidateExecutionAllowed, assertLiveExecutionEnabled, resolveExecutionSettings } from '../src/viero/strategy/executionSettings.js';
 import { planPosition, refreshFixedRangePlan } from '../src/viero/execution/planner.js';
+import { assertFreshV4QuotePlan } from '../src/viero/execution/executor.js';
 import { getChain } from '../src/viero/config/chains.js';
 import { sqrtAtTick, tokenValue } from '../src/viero/screening/math.js';
 import { DEFAULT_POLICY } from '../src/viero/config/policy.js';
@@ -42,6 +43,47 @@ test('FIXED size/range are wired into the planner snapshot', async () => {
   assert.equal(plan.positionSizeUsd, 20); assert.equal(plan.rangePct, 15);
   assert.equal(plan.takeProfitPct, 12); assert.equal(plan.stopLossPct, -8);
   assert.equal(plan.sizeMode, 'FIXED'); assert.equal(plan.rangeMode, 'FIXED');
+  const quote = plan.depositAssets.find(asset => asset.token.toLowerCase() === getChain(4663).primaryStable.toLowerCase());
+  assert.equal(quote?.amount, 20n * 10n ** 6n, 'fixed stable quote amount must remain exactly 20 USDG units');
+});
+
+test('fixed quote preference is resolved per chain for native and stable assets', async () => {
+  const native = await resolveExecutionSettings({
+    controls: fixedControls({ fixedQuoteByChain: { 4663: 'NATIVE' } }),
+    chainId: 4663, ...contexts,
+  });
+  const stable = await resolveExecutionSettings({
+    controls: fixedControls({ enabledChains: [8453], fixedQuoteByChain: { 8453: 'STABLE' } }),
+    chainId: 8453, ...contexts,
+  });
+  assert.equal(native.quoteAsset, 'NATIVE');
+  assert.equal(stable.quoteAsset, 'STABLE');
+});
+
+test('fixed native and stable sizes are resolved independently for the actual pool quote', async () => {
+  const controls = fixedControls({
+    fixedSizeUsd: 10,
+    fixedQuoteByChain: { 4663: 'STABLE' },
+    fixedSizeByChainQuote: { 4663: { NATIVE: 0.005, STABLE: 10 } },
+  });
+  const native = await resolveExecutionSettings({ controls, chainId: 4663, quoteAsset: 'NATIVE', ...contexts });
+  const stable = await resolveExecutionSettings({ controls, chainId: 4663, quoteAsset: 'STABLE', ...contexts });
+  assert.equal(native.positionSizeUsd, 0.005);
+  assert.equal(native.quoteAsset, 'NATIVE');
+  assert.equal(stable.positionSizeUsd, 10);
+  assert.equal(stable.quoteAsset, 'STABLE');
+});
+
+test('V4 mint revalidation accepts only a fresh single-sided quote plan', () => {
+  const observation = demoObservations(DEMO_TIME).find(item => item.state.pool.chainId === 4663 && item.state.pool.protocol === 'v4')!;
+  const candidate = screen(observation, DEFAULT_POLICY, DEMO_TIME);
+  const plan = planPosition(observation, candidate, 10, DEFAULT_POLICY,
+    { totalExposureUsd: 0, chainExposureUsd: {}, dailyLossUsd: 0 }, DEMO_TIME, undefined, 'live', {
+      chainId: 4663, positionSizeUsd: 10, rangePct: 50, takeProfitPct: 5, stopLossPct: -10,
+      sizeMode: 'FIXED', rangeMode: 'FIXED', quoteAsset: 'STABLE',
+    });
+  assert.doesNotThrow(() => assertFreshV4QuotePlan(plan, observation.state));
+  assert.throws(() => assertFreshV4QuotePlan(plan, { ...observation.state, tick: plan.tickLower }), /FIXED_RANGE_NOT_SINGLE_SIDED_QUOTE/);
 });
 
 test('coarse V3 tick spacing moves a WETH quote-only range fully outside current tick', () => {
@@ -69,6 +111,10 @@ test('coarse V3 tick spacing moves a WETH quote-only range fully outside current
   assert.ok(state.tick < refreshed.tickLower);
   assert.equal(refreshed.depositAssets[1]?.amount, 0n);
   assert.ok((refreshed.depositAssets[0]?.amount ?? 0n) > 0n);
+  const requested = plan.depositAssets[0]!.amount;
+  const actual = refreshed.depositAssets[0]!.amount;
+  assert.ok(actual >= requested - 1000n && actual <= requested + 1000n,
+    `single-sided fixed quote drifted: requested=${requested} actual=${actual}`);
 });
 
 test('executor refresh recalculates the entry USD baseline from the actual refreshed deposit', () => {
@@ -118,6 +164,8 @@ test('BNB fixed 50% range uses a single-sided USDT quote deposit without RANGE_L
   const quoteAsset = plan.depositAssets.find(asset => asset.token.toLowerCase() === quote);
   const nonQuoteAsset = plan.depositAssets.find(asset => asset.token.toLowerCase() !== quote);
   assert.ok(quoteAsset && quoteAsset.amount > 0n);
+  const quoteDecimals = (quoteAsset ? observation.state.token0.address.toLowerCase() === quoteAsset.token.toLowerCase() ? observation.state.token0.decimals : observation.state.token1.decimals : 0);
+  assert.equal(quoteAsset?.amount, 10n * 10n ** BigInt(quoteDecimals), 'fixed stable quote amount must remain exactly 10 quote-token units');
   assert.equal(nonQuoteAsset?.amount, 0n);
   assert.ok(plan.tickUpper - plan.tickLower <= DEFAULT_POLICY.maximumRangeWidthTicks);
 });

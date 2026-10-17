@@ -19,6 +19,7 @@ import { factoryAbi, initializeEvent, v4PositionManagerPoolKeyAbi } from '../ada
 import { addressSchema, poolId, type PoolRef } from '../domain.js';
 import { pagedLogs } from '../adapters/events.js';
 import { verifyPool } from './pools.js';
+import { defaultRpcTelemetry } from '../observability/rpcTelemetry.js';
 
 export type TargetedPool = {
   chainId: ChainId;
@@ -79,6 +80,7 @@ export type ExternalPoolHint = {
   volume1hUsd?: number;
   pairCreatedAt?: number;
   source?: 'UNISWAP_GRAPHQL' | 'DEXSCREENER' | 'GECKOTERMINAL';
+  advisoryIssues?: string[];
 };
 export type ExternalPoolShortlist = { addresses: Set<string>; hints: ExternalPoolHint[]; found: number; filtered: number; fallbackUsed: boolean; fallbackReason?: string };
 
@@ -103,7 +105,7 @@ export async function dexScreenerShortlist(chainId: ChainId, token: Address, now
       const identity = String(r.pairAddress ?? '');
       return r.chainId === 'robinhood' && r.dexId === 'uniswap' && protocol !== null && exactPair && allowed
         && (protocol === 'v4' ? HEX32.test(identity) : HEX20.test(identity))
-        && Number.isFinite(liquidity) && liquidity >= 25_000 && Number.isFinite(age) && now - age >= 1_800_000;
+        ;
     }).sort((a, b) => Number(b.liquidity.usd) - Number(a.liquidity.usd) || String(a.pairAddress).localeCompare(String(b.pairAddress))).slice(0, 10);
     if (!candidates.length) return { addresses: new Set(), hints: [], found: rows.length, filtered: rows.length, fallbackUsed: true, fallbackReason: 'NO_USABLE_POOLS' };
     const hints: ExternalPoolHint[] = candidates.map(row => {
@@ -111,12 +113,18 @@ export async function dexScreenerShortlist(chainId: ChainId, token: Address, now
       const quote = addressSchema.parse(String(row.quoteToken.address));
       const protocol = (Array.isArray(row.labels) && row.labels.map(String).includes('v4')) ? 'v4' : 'v3';
       const rawId = String(row.pairAddress).toLowerCase();
+      const liquidity = Number(row.liquidity?.usd), age = Number(row.pairCreatedAt);
       const key = protocol === 'v4' && row.poolKey && typeof row.poolKey === 'object' ? row.poolKey : undefined;
+      const advisoryIssues: string[] = [];
+      if (!Number.isFinite(liquidity)) advisoryIssues.push('LIQUIDITY_UNAVAILABLE');
+      if (!Number.isFinite(Number(row.volume?.h1))) advisoryIssues.push('VOLUME_1H_UNAVAILABLE');
+      if (!Number.isFinite(age)) advisoryIssues.push('CREATION_TIME_UNAVAILABLE');
+      else if (now - age < 1_800_000) advisoryIssues.push('CREATION_TIME_FRESH');
       return {
         identity: rawId, protocol, token0: BigInt(base) < BigInt(quote) ? base : quote, token1: BigInt(base) < BigInt(quote) ? quote : base,
         fee: Number(key?.fee ?? row.fee), tickSpacing: Number(key?.tickSpacing), hooks: key?.hooks ? addressSchema.parse(String(key.hooks)) : undefined,
         poolId: protocol === 'v4' ? rawId as `0x${string}` : undefined,
-        liquidityUsd: Number(row.liquidity.usd), volume1hUsd: Number(row.volume?.h1), pairCreatedAt: Number(row.pairCreatedAt), source: 'DEXSCREENER',
+        liquidityUsd: Number.isFinite(liquidity) ? liquidity : undefined, volume1hUsd: Number.isFinite(Number(row.volume?.h1)) ? Number(row.volume.h1) : undefined, pairCreatedAt: Number.isFinite(age) ? age : undefined, source: 'DEXSCREENER', advisoryIssues,
       };
     });
     return { addresses: new Set(hints.map(h => h.identity)), hints, found: rows.length, filtered: rows.length - candidates.length, fallbackUsed: false };
@@ -172,9 +180,11 @@ export async function fetchGeckoV3Hints(chainId: ChainId, token: Address): Promi
     const [token0, token1] = [addressSchema.parse(base), addressSchema.parse(quote)].sort((a, b) => BigInt(a) < BigInt(b) ? -1 : 1);
     const counterpart = token0.toLowerCase() === token.toLowerCase() ? token1 : token1.toLowerCase() === token.toLowerCase() ? token0 : null;
     if (!counterpart || !allowed.has(counterpart.toLowerCase())) continue;
-    const liquidityUsd = Number(p.attributes?.reserve_in_usd);
-    if (!Number.isFinite(liquidityUsd) || liquidityUsd <= 0) continue;
-    hints.push({ identity, protocol: 'v3', token0, token1, liquidityUsd, source: 'GECKOTERMINAL' });
+    const liquidityUsd = Number(p.attributes?.reserve_in_usd), advisoryIssues: string[] = [];
+    if (!Number.isFinite(liquidityUsd)) advisoryIssues.push('LIQUIDITY_UNAVAILABLE');
+    const createdAt = Date.parse(String(p.attributes?.pool_created_at ?? '')) / 1000;
+    if (!Number.isFinite(createdAt)) advisoryIssues.push('CREATION_TIME_UNAVAILABLE');
+    hints.push({ identity, protocol: 'v3', token0, token1, liquidityUsd: Number.isFinite(liquidityUsd) ? liquidityUsd : undefined, pairCreatedAt: Number.isFinite(createdAt) ? createdAt : undefined, source: 'GECKOTERMINAL', advisoryIssues });
   }
   return hints.sort((a, b) => (b.liquidityUsd ?? 0) - (a.liquidityUsd ?? 0) || a.identity.localeCompare(b.identity));
 }
@@ -279,6 +289,8 @@ export type PoolDiscoveryEvidence = {
   fallbackUsed: boolean;
   fallbackReason?: string;
   providerErrors: string[];
+  advisoryIssues: Array<{ identity: string; source: string; issues: string[] }>;
+  providerDisagreements: string[];
   finalOutcome?: 'VERIFIED_POOLS' | 'NO_SUPPORTED_POOL' | 'PROVIDER_FAILURE';
   ranked: Array<{ identity: string; protocol: 'v3' | 'v4'; source: string; liquidityUsd: number | null; activeLiquidity: string; recoveryMethod?: string }>;
   selectedPool?: string;
@@ -299,7 +311,7 @@ export async function searchVerifiedPoolsForToken(
   client: PublicClient, chainId: ChainId, token: Address,
   options: { dex?: ExternalPoolShortlist; verify?: typeof verifyPool; head?: bigint } = {},
 ): Promise<{ pools: VerifiedTargetedPool[]; evidence: PoolDiscoveryEvidence }> {
-  const evidence: PoolDiscoveryEvidence = { graphqlV4Hints: [], dexV4Hints: [], dexV3Hints: [], geckoV3FallbackUsed: false, geckoV3Hints: [], recovery: [], verification: [], fallbackUsed: false, providerErrors: [], ranked: [] };
+  const evidence: PoolDiscoveryEvidence = { graphqlV4Hints: [], dexV4Hints: [], dexV3Hints: [], geckoV3FallbackUsed: false, geckoV3Hints: [], recovery: [], verification: [], fallbackUsed: false, providerErrors: [], advisoryIssues: [], providerDisagreements: [], ranked: [] };
   const verify = options.verify ?? verifyPool;
   const [graphqlResult, dexResult] = await Promise.allSettled([
     fetchUniswapV4Hints(chainId, token),
@@ -319,6 +331,16 @@ export async function searchVerifiedPoolsForToken(
     try { gecko = await fetchGeckoV3Hints(chainId, token); }
     catch (error) { evidence.providerErrors.push(`GECKO:${String(error).slice(0, 120)}`); }
     evidence.geckoV3Hints = gecko.map(h => ({ poolAddress: h.identity, liquidityUsd: h.liquidityUsd ?? null }));
+  }
+  const allHints = [...graphql, ...dexHints, ...gecko];
+  for (const hint of allHints) if (hint.advisoryIssues?.length) evidence.advisoryIssues.push({ identity: hint.identity, source: hint.source ?? 'unknown', issues: [...hint.advisoryIssues] });
+  const byIdentity = new Map<string, ExternalPoolHint[]>();
+  for (const hint of allHints) { const key = `${hint.protocol}:${hint.identity.toLowerCase()}`; byIdentity.set(key, [...(byIdentity.get(key) ?? []), hint]); }
+  for (const [identity, matches] of byIdentity) {
+    if (matches.length < 2) continue;
+    const pairs = new Set(matches.map(h => `${h.token0.toLowerCase()}:${h.token1.toLowerCase()}`));
+    const liquidity = matches.map(h => h.liquidityUsd).filter((v): v is number => Number.isFinite(v));
+    if (pairs.size > 1 || (liquidity.length > 1 && Math.max(...liquidity) / Math.max(1, Math.min(...liquidity)) > 1.25)) evidence.providerDisagreements.push(`${identity}:ADVISORY_FIELDS_DISAGREE`);
   }
   const hints = mergeExternalPoolHints(graphql, dexHints, gecko);
   let initializeAlreadySearched = false;
@@ -466,7 +488,7 @@ export async function discoverV4PoolsForToken(
       strict: true,
       fromBlock: start,
       toBlock: end,
-    }), 50_000n);
+    }), 50_000n, 1000, { chainId, telemetry: defaultRpcTelemetry });
   }))).flat();
 
   const results: TargetedPool[] = [];

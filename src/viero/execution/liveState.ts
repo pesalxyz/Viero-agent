@@ -14,7 +14,7 @@ export type LivePosition = {
   closeReason: string | null;
 };
 export type ExecutionTransaction = {
-  id: string; chainId: ChainId; positionId?: string; action: 'approve' | 'swap' | 'mint' | 'claim' | 'decrease' | 'burn';
+  id: string; chainId: ChainId; positionId?: string; action: 'approve' | 'wrap' | 'swap' | 'mint' | 'claim' | 'decrease' | 'burn';
   hash: `0x${string}`; at: number; status: 'confirmed' | 'failed'; blockNumber?: bigint; detail: string;
 };
 export type StrategyLesson = { at: number; chainId: ChainId; poolIdentity: string; outcome: 'win' | 'loss' | 'risk-exit'; pnlUsd: number | null; reason: string };
@@ -35,6 +35,7 @@ export const positionPlanSchema = z.object({
   positionSizeUsd: z.number().finite().positive().optional(), rangePct: z.number().finite().min(1).max(99).optional(),
   takeProfitPct: z.number().finite().positive().optional(), stopLossPct: z.number().finite().negative().optional(),
   sizeMode: z.enum(['AUTO', 'FIXED']).optional(), rangeMode: z.enum(['AUTO', 'FIXED']).optional(),
+  quoteAsset: z.enum(['NATIVE', 'STABLE']).optional(),
 }).transform(plan => ({ ...plan,
   positionSizeUsd: plan.positionSizeUsd ?? plan.depositUsd,
   rangePct: plan.rangePct ?? 1,
@@ -42,6 +43,7 @@ export const positionPlanSchema = z.object({
   stopLossPct: plan.stopLossPct ?? -15,
   sizeMode: plan.sizeMode ?? 'FIXED' as const,
   rangeMode: plan.rangeMode ?? 'FIXED' as const,
+  quoteAsset: plan.quoteAsset ?? 'STABLE' as const,
 }));
 const normalizationSchema = z.object({ status: z.enum(['not-required', 'pending', 'complete', 'failed', 'blocked']),
   targetToken: addressSchema.nullable(), attempts: z.number().int().nonnegative(), lastError: z.string().nullable() }).strict();
@@ -57,7 +59,7 @@ const positionSchema = z.object({
   status: 'not-required' as const, targetToken: null, attempts: 0, lastError: null,
 }, closeReason: position.closeReason ?? null }));
 export const executionTransactionSchema = z.object({ id: z.string(), chainId: chainIdSchema, positionId: z.string().optional(),
-  action: z.enum(['approve', 'swap', 'mint', 'claim', 'decrease', 'burn']), hash: hex32Schema, at: z.number(),
+  action: z.enum(['approve', 'wrap', 'swap', 'mint', 'claim', 'decrease', 'burn']), hash: hex32Schema, at: z.number(),
   status: z.enum(['confirmed', 'failed']), blockNumber: bigintSchema.optional(), detail: z.string() });
 const lessonSchema = z.object({ at: z.number(), chainId: chainIdSchema, poolIdentity: z.string(), outcome: z.enum(['win', 'loss', 'risk-exit']), pnlUsd: z.number().nullable(), reason: z.string() });
 const managementNotificationSchema = z.object({ id: z.string(), kind: z.enum(['opened', 'closing', 'closed', 'close_failed', 'normalization']), positionId: z.string(), symbol: z.string().optional(), targetSymbol: z.string().optional(), protocol: z.enum(['v3', 'v4']), tokenId: z.string(), reason: z.string().optional(), pnlPct: z.number().nullable().optional(), valueUsd: z.number().nullable().optional(), feeUsd: z.number().nullable().optional(), txHash: hex32Schema.optional(), status: z.string().optional(), error: z.string().optional(), at: z.number(), delivered: z.boolean().optional() }).strict();

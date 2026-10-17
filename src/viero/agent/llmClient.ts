@@ -6,10 +6,9 @@
  * (OpenRouter, LM Studio, vLLM, Ollama, etc.).
  *
  * Configuration is read from `VIERO_LLM_*` environment variables via
- * `readLlmConfig()`. Viero is an LLM-first product: an API key and a
- * reachable base URL are required. The base URL defaults to OpenRouter
- * so the typical "just give it an OpenRouter API key" workflow needs
- * only `VIERO_LLM_API_KEY`.
+ * `readLlmConfig()`. Deterministic agent workflows do not construct this
+ * client. An API key is required only when an explicitly LLM-dependent
+ * feature is enabled.
  *
  * Uses Node 20+ built-in `fetch`. No new npm packages are required.
  *
@@ -21,6 +20,7 @@ const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
 const DEFAULT_MODEL = 'openai/gpt-4o-mini';
 
 const llmEnvSchema = z.object({
+  VIERO_LLM_ENABLED: z.string().optional(),
   VIERO_LLM_BASE_URL: z.string().min(1).optional(),
   VIERO_LLM_API_KEY: z.string().optional(),
   VIERO_LLM_MODEL: z.string().min(1).optional(),
@@ -228,6 +228,14 @@ export class OpenAiCompatibleClient implements LlmClient {
 export function createLlmClient(env: NodeJS.ProcessEnv = process.env, fetchImpl?: typeof fetch): LlmClient {
   const config = readLlmConfig(env);
   return new OpenAiCompatibleClient(config, fetchImpl);
+}
+
+/** Optional analysis client; blank credentials never block deterministic modes. */
+export function createOptionalLlmClient(env: NodeJS.ProcessEnv = process.env, fetchImpl?: typeof fetch): LlmClient | undefined {
+  const enabled = env.VIERO_LLM_ENABLED?.trim().toLowerCase();
+  const key = env.VIERO_LLM_API_KEY?.trim();
+  if (enabled === 'false' || !key) return undefined;
+  return createLlmClient(env, fetchImpl);
 }
 
 /** Error thrown when the LLM is invoked without required configuration. */

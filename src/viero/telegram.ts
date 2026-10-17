@@ -10,6 +10,7 @@ import { activePositionButtons, formatActivePositionCard, formatClosePositionMes
 import { effectivePnlDepositUsd, pnlPctFromValues } from './management/pnl.js';
 import { isAddress } from 'viem';
 import { BlockedTokenStore } from './storage/blockedTokens.js';
+import { fixedSizeForQuote } from './strategy/executionSettings.js';
 
 type TelegramUser = { id: number };
 type TelegramMessage = { message_id: number; from?: TelegramUser; chat: { id: number }; text?: string };
@@ -278,7 +279,14 @@ export function validateStartSettings(controls: Controls): string[] {
   if (!(typeof controls.takeProfitPct === 'number' && Number.isFinite(controls.takeProfitPct) && controls.takeProfitPct > 0)) errors.push('set Take Profit to a percentage greater than 0');
   if (!(typeof controls.stopLossPct === 'number' && Number.isFinite(controls.stopLossPct) && controls.stopLossPct < 0)) errors.push('set Stop Loss to a negative percentage');
   if (controls.sizeMode === 'FIXED') {
-    if (!(typeof controls.fixedSizeUsd === 'number' && Number.isFinite(controls.fixedSizeUsd) && controls.fixedSizeUsd > 0)) errors.push('set a valid Fixed Size in USD');
+    for (const chainId of controls.enabledChains ?? []) {
+      const chain = getChain(chainId);
+      const required: Array<'NATIVE' | 'STABLE'> = chain.wrappedNative ? ['NATIVE', 'STABLE'] : ['STABLE'];
+      for (const quote of required) if (fixedSizeForQuote(controls, chainId, quote) == null) {
+        const label = quote === 'NATIVE' ? chain.native.symbol : chainId === 4663 ? 'USDG' : chainId === 8453 ? 'USDC' : chainId === 56 ? 'USDT' : 'USDC';
+        errors.push(`set a valid Fixed Size ${label} amount for ${chain.name}`);
+      }
+    }
   } else if (controls.sizeMode !== 'AUTO') errors.push('select Auto Size or Fixed Size');
   if (controls.rangeMode === 'FIXED') {
     if (!(typeof controls.fixedRangePct === 'number' && Number.isFinite(controls.fixedRangePct) && controls.fixedRangePct >= 1 && controls.fixedRangePct <= 99)) errors.push('set a valid Fixed Range from 1% to 99%');
@@ -293,6 +301,8 @@ export class TelegramBot {
   private automaticReportsInitialized = false;
   private lastAutomaticReportId: string | null = null;
   private pendingSetting = new Map<number, 'fixedSizeUsd' | 'fixedRangePct' | 'takeProfitPct' | 'stopLossPct'>();
+  private pendingFixedQuoteChain = new Map<number, ChainId>();
+  private pendingFixedQuotePreference = new Map<number, 'NATIVE' | 'STABLE'>();
   private positionActions = new Set<string>();
 
   constructor(private options: TelegramOptions) {
@@ -317,8 +327,15 @@ export class TelegramBot {
         const updates = await this.getUpdates();
         for (const update of updates) {
           this.offset = Math.max(this.offset, update.update_id + 1);
-          if (update.message) await this.handleMessage(update.message);
-          if (update.callback_query) await this.handleCallbackQuery(update.callback_query);
+          // An individual Telegram API failure (for example while handling
+          // /stop) must not terminate the polling loop and strand the next
+          // /settings update behind a rejected promise.
+          try {
+            if (update.message) await this.handleMessage(update.message);
+            if (update.callback_query) await this.handleCallbackQuery(update.callback_query);
+          } catch (error) {
+            console.error(`telegram update ${update.update_id} failed: ${errorMessage(error)}`);
+          }
         }
       }
     } finally {
@@ -693,10 +710,43 @@ export class TelegramBot {
       await this.send(chatId, `${size ? 'Auto Size' : 'Auto Range'} selected. Deterministic market-cap/volatility rules will apply on the next candidate.`);
       return;
     }
-    if (action === 'settings:fixed_size' || action === 'settings:fixed_range') {
-      const size = action.endsWith('size');
-      this.pendingSetting.set(query.from.id, size ? 'fixedSizeUsd' : 'fixedRangePct');
-      await this.send(chatId, size ? 'Enter position size in USD (positive number), for example: 25' : 'Enter the single-side range width from 1% to 99%, for example: 15');
+    if (action === 'settings:fixed_size') {
+      await this.send(chatId, 'Choose the Fixed Size quote asset by chain:', {
+        inline_keyboard: (controls.enabledChains ?? []).map(id => [{ text: `${getChain(id).name} (${id})`, callback_data: `settings:fixed_chain:${id}` }]),
+      });
+      return;
+    }
+    if (action.startsWith('settings:fixed_chain:')) {
+      const chainId = chainIdSchema.parse(Number(action.split(':')[2]));
+      const chain = getChain(chainId);
+      const stableLabel = chainId === 4663 ? 'USDG' : chainId === 8453 ? 'USDC' : chainId === 56 ? 'USDT' : 'USDC';
+      const nativeSize = fixedSizeForQuote(controls, chainId, 'NATIVE');
+      const stableSize = fixedSizeForQuote(controls, chainId, 'STABLE');
+      const buttons = chain.wrappedNative
+        ? [[{ text: `Size ${nativeSize ?? 'not set'} ${chain.native.symbol}`, callback_data: `settings:fixed_quote:${chainId}:NATIVE` }], [{ text: `Size ${stableSize ?? 'not set'} ${stableLabel}`, callback_data: `settings:fixed_quote:${chainId}:STABLE` }]]
+        : [[{ text: `Size ${stableSize ?? 'not set'} ${stableLabel}`, callback_data: `settings:fixed_quote:${chainId}:STABLE` }]];
+      const summary = chain.wrappedNative
+        ? `${chain.native.symbol}\nSize ${nativeSize ?? 'not set'} ${chain.native.symbol}\n\n${stableLabel}\nSize ${stableSize ?? 'not set'} ${stableLabel}`
+        : `${stableLabel}\nSize ${stableSize ?? 'not set'} ${stableLabel}`;
+      await this.send(chatId, `Fixed Size for ${chain.name}:\n\n${summary}\n\nClick a Size field to change it.`, { inline_keyboard: buttons as any });
+      return;
+    }
+    if (action.startsWith('settings:fixed_quote:')) {
+      const [, , chainText, preference] = action.split(':');
+      const chainId = chainIdSchema.parse(Number(chainText));
+      const controlsNext = { ...controls, fixedQuoteByChain: { ...(controls.fixedQuoteByChain ?? {}), [chainId]: preference as 'NATIVE' | 'STABLE' } };
+      await this.options.repo.setControls(controlsNext);
+      this.pendingFixedQuoteChain.set(query.from.id, chainId);
+      this.pendingFixedQuotePreference.set(query.from.id, preference as 'NATIVE' | 'STABLE');
+      this.pendingSetting.set(query.from.id, 'fixedSizeUsd');
+      const chain = getChain(chainId);
+      const label = preference === 'NATIVE' ? chain.native.symbol : chainId === 4663 ? 'USDG' : chainId === 8453 ? 'USDC' : chainId === 56 ? 'USDT' : 'USDC';
+      await this.send(chatId, `Enter Fixed Size ${label} amount for ${chain.name}, for example: ${preference === 'NATIVE' ? '0.005' : '10'}`);
+      return;
+    }
+    if (action === 'settings:fixed_range') {
+      this.pendingSetting.set(query.from.id, 'fixedRangePct');
+      await this.send(chatId, 'Enter the single-side range width from 1% to 99%, for example: 15');
       return;
     }
     if (action === 'settings:chain') { await this.sendChainMenu(chatId, controls); return; }
@@ -769,6 +819,24 @@ export class TelegramBot {
   }
 
   private async renderPositionCard(chatId: number, position: import('./execution/liveState.js').LivePosition, currentTick?: number, messageId?: number, existingText?: string) {
+    // The latest persisted cycle snapshot is the canonical observation that
+    // management evaluated. Reuse it for Refresh and position cards so the
+    // card cannot show a different PnL/fee read from a later RPC call.
+    const latest = await this.options.repo.latest();
+    const snapshot = latest?.livePositions?.find(item => item.id === position.id && item.status === position.status);
+    if (snapshot) {
+      const text = formatActivePositionCard({ symbol: snapshot.symbol ?? (position.plan.pool.protocol === 'v4' ? 'V4 position' : 'V3 position'), protocol: position.plan.pool.protocol,
+        tokenId: position.tokenId, openedAt: snapshot.openedAt, now: Date.now() / 1000,
+        lowerPrice: snapshot.lowerPrice ?? null, upperPrice: snapshot.upperPrice ?? null, currentPrice: snapshot.currentPrice ?? null,
+        baseSymbol: snapshot.baseSymbol ?? snapshot.symbol ?? 'base', quoteSymbol: snapshot.quoteSymbol ?? 'quote', valueUsd: snapshot.valueUsd ?? null,
+        feeUsd: snapshot.feeUsd ?? null, feeDetails: snapshot.feeDetails ?? null, pnlPct: snapshot.pnlPct ?? null, inRange: snapshot.inRange,
+        positionBase: position.plan.pool.protocol === 'v4' ? 'https://app.uniswap.org/positions/v4/robinhood' : undefined });
+      const replyMarkup = activePositionButtons({ symbol: position.plan.pool.protocol === 'v4' ? 'V4 position' : 'V3 position', protocol: position.plan.pool.protocol, tokenId: position.tokenId });
+      if (messageId !== undefined) {
+        if (existingText !== text) await this.api('editMessageText', { chat_id: chatId, message_id: messageId, text, disable_web_page_preview: true, reply_markup: replyMarkup });
+      } else await this.send(chatId, text, replyMarkup);
+      return;
+    }
     let enriched: any = null;
     try {
       enriched = position.plan.pool.protocol === 'v3'
@@ -778,7 +846,7 @@ export class TelegramBot {
     const feeDetails = enriched?.feeEvidence && enriched?.fee0Human != null && enriched?.fee1Human != null
       ? `${enriched.fee0Human} ${enriched.token0?.symbol ?? 'token0'} + ${enriched.fee1Human} ${enriched.token1?.symbol ?? 'token1'}` : null;
     const pnlValue = enriched?.feeEvidence && enriched?.feeUsd != null && enriched?.valueUsd != null ? enriched.valueUsd + enriched.feeUsd : enriched?.feeEvidence === false ? null : enriched?.valueUsd;
-    const pnlDepositUsd = effectivePnlDepositUsd({ persistedDepositUsd: position.plan.depositUsd, entryPrincipalUsd: position.entryPrincipalUsd, principalValueUsd: enriched?.valueUsd ?? null,
+    const pnlDepositUsd = effectivePnlDepositUsd({ persistedDepositUsd: position.plan.depositUsd, entryPrincipalUsd: enriched?.entryPrincipalUsd ?? position.entryPrincipalUsd, principalValueUsd: enriched?.valueUsd ?? null,
       token0Address: enriched?.token0?.address, token1Address: enriched?.token1?.address, amount0: enriched?.amount0, amount1: enriched?.amount1,
       primaryStable: getChain(position.chainId).primaryStable });
     const text = formatActivePositionCard({ symbol: enriched?.baseSymbol ?? (position.plan.pool.protocol === 'v4' ? 'V4 position' : 'V3 position'), protocol: position.plan.pool.protocol,
@@ -799,15 +867,29 @@ export class TelegramBot {
     const valid = Number.isFinite(value) && (field === 'fixedSizeUsd' || field === 'takeProfitPct' ? value > 0
       : field === 'fixedRangePct' ? value >= 1 && value <= 99 : value < 0);
     if (!valid) {
-      const requirement = field === 'fixedSizeUsd' ? 'a positive finite USD amount' : field === 'fixedRangePct' ? 'a number from 1 to 99' : field === 'takeProfitPct' ? 'a percentage greater than 0' : 'a negative percentage';
+      const requirement = field === 'fixedSizeUsd' ? 'a positive finite quote-token amount' : field === 'fixedRangePct' ? 'a number from 1 to 99' : field === 'takeProfitPct' ? 'a percentage greater than 0' : 'a negative percentage';
       await this.send(chatId, `Invalid value. Enter ${requirement}.`);
       return;
     }
     const controls = await this.options.repo.controls();
     const mode = field === 'fixedSizeUsd' ? { sizeMode: 'FIXED' as const } : field === 'fixedRangePct' ? { rangeMode: 'FIXED' as const } : {};
-    await this.options.repo.setControls({ ...controls, ...mode, [field]: value });
+    const chainId = this.pendingFixedQuoteChain.get(userId);
+    const preference = this.pendingFixedQuotePreference.get(userId);
+    const fixedQuoteUpdate = field === 'fixedSizeUsd' && chainId && preference ? {
+      fixedSizeUsd: value,
+      fixedQuoteByChain: { ...(controls.fixedQuoteByChain ?? {}), [chainId]: preference },
+      fixedSizeByChainQuote: {
+        ...(controls.fixedSizeByChainQuote ?? {}),
+        [chainId]: { ...(controls.fixedSizeByChainQuote?.[chainId] ?? {}), [preference]: value },
+      },
+    } : { [field]: value };
+    await this.options.repo.setControls({ ...controls, ...mode, ...fixedQuoteUpdate });
     this.pendingSetting.delete(userId);
-    await this.send(chatId, `${field === 'fixedSizeUsd' ? 'Fixed Size' : field === 'fixedRangePct' ? 'Fixed Range' : field === 'takeProfitPct' ? 'Take Profit' : 'Stop Loss'} saved: ${value}${field === 'fixedSizeUsd' ? ' USD' : '%'}.`);
+    this.pendingFixedQuoteChain.delete(userId);
+    this.pendingFixedQuotePreference.delete(userId);
+    const quote = field === 'fixedSizeUsd' && chainId ? preference ?? controls.fixedQuoteByChain?.[chainId] ?? 'STABLE' : null;
+    const quoteLabel = quote === 'NATIVE' ? getChain(chainId!).native.symbol : chainId === 4663 ? 'USDG' : chainId === 8453 ? 'USDC' : chainId === 56 ? 'USDT' : 'USDC';
+    await this.send(chatId, `${field === 'fixedSizeUsd' ? 'Fixed Size' : field === 'fixedRangePct' ? 'Fixed Range' : field === 'takeProfitPct' ? 'Take Profit' : 'Stop Loss'} saved: ${value}${field === 'fixedSizeUsd' ? ` ${quoteLabel} (quote-token units)` : '%'}.`);
   }
 
   private async sendChainMenu(chatId: number, controls: Controls) {
@@ -853,16 +935,25 @@ export class TelegramBot {
   }
 
   private async api<T = unknown>(method: string, body: Record<string, unknown> = {}): Promise<T> {
-    const response = await this.fetchImpl(`https://api.telegram.org/bot${this.options.token}/${method}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: this.options.signal,
-    });
-    if (!response.ok) throw new Error(`TELEGRAM_HTTP_${response.status}`);
-    const payload = await response.json() as TelegramResponse<T>;
-    if (!payload.ok) throw new Error(payload.description ?? `TELEGRAM_${method}_FAILED`);
-    return payload.result as T;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15_000);
+    const onAbort = () => controller.abort();
+    this.options.signal?.addEventListener('abort', onAbort, { once: true });
+    try {
+      const response = await this.fetchImpl(`https://api.telegram.org/bot${this.options.token}/${method}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(`TELEGRAM_HTTP_${response.status}`);
+      const payload = await response.json() as TelegramResponse<T>;
+      if (!payload.ok) throw new Error(payload.description ?? `TELEGRAM_${method}_FAILED`);
+      return payload.result as T;
+    } finally {
+      clearTimeout(timeout);
+      this.options.signal?.removeEventListener('abort', onAbort);
+    }
   }
 }
 

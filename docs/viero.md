@@ -6,7 +6,7 @@ The Viero entry point has **no signer, private-key reader, approvals, or transac
 
 ## Quick start
 
-Node 20.12+ and npm are sufficient. Bun is not required for the agent or the combined build.
+Node 24.15+ and npm are required for the agent and its SQLite operation-store foundation. Bun is not required for the agent or the combined build.
 
 ```sh
 npm install
@@ -56,13 +56,20 @@ npm run agent -- pause
 npm run agent -- resume
 ```
 
-Chain exposure, TVL, and depth defaults are in `src/viero/config/policy.ts`. They are paper placeholders from the blueprint, not investment recommendations. Every run stores the effective policy. The supervisor pauses a failing chain after three failed observation cycles; operator pauses survive restarts. Global and chain pauses are independent. The watch command rechecks them between cycles and handles SIGINT/SIGTERM. It schedules a sequential multi-chain screening cycle; independent management/risk/health schedules are future work.
+Chain exposure, TVL, and depth defaults are in `src/viero/config/policy.ts`. They are paper placeholders from the blueprint, not investment recommendations. Every run stores the effective policy. The supervisor pauses a failing chain after three failed observation cycles; operator pauses survive restarts. Global and chain pauses are independent. The watch command rechecks them between cycles and handles SIGINT/SIGTERM. The live command schedules sequential multi-chain screening and management loops; both cadences are policy-controlled and default to five minutes.
 
 All candidates require verified pool identity, approved quotes, pool age, two-sided depth, exact-pool activity, LP-net fees, a fresh canonical price, risk evidence for both tokens, successful simulation evidence, and positive lifecycle-cost-adjusted fees. Missing evidence rejects the pool. Price priority matches UniCrit: stablecoin peg, GMGN primary, GeckoTerminal fallback; DexScreener is discovery-only. Dynamic v4 pools require enriched LP-net fees; unknown hooks remain blocked. Exact pool identities include chain, protocol, and venue.
 
 `@pancakeswap/v3-sdk` 3.9.3 provides the established concentrated-liquidity TickMath. It is pinned to avoid unrelated Solana and deprecated Hardhat dependency trees introduced by newer aggregate SDKs; the math is shared by these v3/v4 pool paths. Integer arithmetic computes amounts and traverses initialized ticks in both directions. A liquidity gap is rejected rather than extrapolated. Stored `tokensOwed` is not treated as total live fees: fee-growth helpers include modulo-2^256 accounting and Q128 accrual.
 
 Ranking uses the blueprint's eight weights, normalizes within chain/window/age/quote groups, records penalties, and adds a global net-fee component. The implemented organic features are trader ratio, concentration, direction balance, minute coverage, and fast reversals. Common-funder clustering, bot/sandwich identification, and KOL attribution require additional indexed data and are not claimed as implemented.
+
+Each close or claim handoff performs a separate fresh confirmation before
+calling the isolated signer. The signer owns the wallet key, simulation,
+authorization, receipt wait, and journal; the agent reaches it only over the
+protected Unix socket. The indexer is optional and is not required by
+token-first discovery or lightweight management. Its enabled or disabled state
+is a deployment property and must be checked on the target host.
 
 Arc has one USDC balance. Its native 18-decimal and ERC20 6-decimal views must agree at the same block; the library converts by `10^12`, preserves dust, and subtracts gas reserves from the shared spendable balance. There is no wrapped-USDC abstraction.
 

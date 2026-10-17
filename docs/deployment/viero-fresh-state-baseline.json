@@ -1,0 +1,42 @@
+{
+  "manifestVersion": 1,
+  "purpose": "disposable-schema-v2-fresh-state-baseline",
+  "historicalState": {
+    "import": false,
+    "archiveDisposition": "UNRESOLVED_HISTORICAL_NORMALIZATION — OPERATOR_ACCEPTED_RISK",
+    "normalizationRetry": false
+  },
+  "agent": {
+    "strategyState": "empty",
+    "positions": 0,
+    "transactions": 0,
+    "controls": {
+      "botState": "STOPPED",
+      "globalPaused": false,
+      "enabledChains": []
+    }
+  },
+  "signer": {
+    "operationStore": {
+      "schemaVersion": 2,
+      "unresolved": 0,
+      "projectionAcknowledgementsPending": 0,
+      "closeWorkflowsUnresolved": 0
+    },
+    "relayOperationStore": {
+      "schemaVersion": 2,
+      "unresolved": 0
+    },
+    "filesystem": {
+      "directoryMode": "0700",
+      "agentDirectDatabaseAccess": false,
+      "socketOnlyBoundary": true
+    }
+  },
+  "activation": {
+    "services": "inactive-and-disabled",
+    "indexer": "disabled",
+    "liveExecution": "disabled",
+    "productionInitialization": "not-authorized-by-this-manifest"
+  }
+}

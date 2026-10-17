@@ -33,14 +33,15 @@ import {
   type AnalysisContext,
 } from '../src/viero/agent/analysisContext.js';
 import { erc20TransferEvent } from '../src/viero/adapters/abi.js';
-import { type ChainId } from '../src/viero/domain.js';
+import { structuredExecutionError, type ChainId } from '../src/viero/domain.js';
 import { type Candidate } from '../src/viero/screening/pipeline.js';
 import { type LivePosition } from '../src/viero/execution/liveState.js';
 import { demoObservations } from '../src/viero/fixtures/demo.js';
 import { contractRequestToTransactionRequest, decodeIncomingErc20Transfers, inspectCloseLiquidity, reconcileClosedWithoutReceipt } from '../src/viero/execution/executor.js';
-import { Agent, closeNotificationPnlPct } from '../src/viero/workers/screeningWorker.js';
+import { Agent, closeNotificationPnlPct, shouldAttemptPostCloseNormalization } from '../src/viero/workers/screeningWorker.js';
 import { sqrtAtTick } from '../src/viero/screening/math.js';
 import type { Controls, Repository } from '../src/viero/storage/repositories.js';
+import { v4MaximumAmount } from '../src/viero/execution/calldata.js';
 
 // ─── Helpers ───────────────────────────────────────────────────
 
@@ -78,6 +79,17 @@ test('V4 modifyLiquidities request cannot become a null-destination transaction'
   assert.notEqual(request.to, null);
   assert.match(request.data, /^0x/);
   assert.ok(request.data.length > 10);
+});
+
+test('V4 mint maxima include one raw-unit rounding headroom without changing zero amounts', () => {
+  assert.equal(v4MaximumAmount(0n), 0n);
+  assert.equal(v4MaximumAmount(9_125_991n), 9_125_992n);
+});
+
+test('MaximumAmountExceeded is decoded and persisted as structured execution evidence', () => {
+  const info = structuredExecutionError({ raw: '0x31e30ad0' + '0'.repeat(58) + '8b4067' + '0'.repeat(58) + '8b4068' });
+  assert.equal(info.code, 'MAXIMUM_AMOUNT_EXCEEDED');
+  assert.deepEqual(info.details, { maximumRaw: '9125991', requiredRaw: '9125992' });
 });
 
 function poolIdOf(): string {
@@ -167,7 +179,7 @@ test('historicalRejections emits POSITION_CAPACITY + DUPLICATE_EXPOSURE + DUPLIC
   assert.ok(set.has('DUPLICATE_TOKEN_EXPOSURE'));
 });
 
-test('historicalRejections emits POOL_COOLDOWN when pool is in cooldown', () => {
+test('historicalRejections does not suppress a pool solely because legacy cooldown state exists', () => {
   const obs = demoObservations()[0]!;
   const candidate = makeApprovedCandidate();
   const now = obs.state.observedAt;
@@ -180,7 +192,7 @@ test('historicalRejections emits POOL_COOLDOWN when pool is in cooldown', () => 
     lessons: [],
     dailyRealizedLossUsd: {},
   }, DEFAULT_POLICY, now);
-  assert.ok(codes.some((c) => c.code === 'POOL_COOLDOWN'));
+  assert.equal(codes.some((c) => c.code === 'POOL_COOLDOWN'), false);
 });
 
 test('historicalRejections ignores trusted quote blacklist entries', () => {
@@ -230,7 +242,7 @@ test('historicalRejections emits DAILY_LOSS_LIMIT when daily realized loss is at
 
 // ─── recordClosedOutcome ─────────────────────────────────────
 
-test('recordClosedOutcome applies pool cooldown + blacklist on risk-exit', () => {
+test('recordClosedOutcome records risk-exit without creating a pool cooldown', () => {
   const obs = demoObservations()[0]!;
   const now = obs.state.observedAt;
   const state = {
@@ -243,13 +255,13 @@ test('recordClosedOutcome applies pool cooldown + blacklist on risk-exit', () =>
     dailyRealizedLossUsd: {} as Record<string, number>,
   };
   recordClosedOutcome(state, obs, 'p', 'HONEYPOT detected on exit', now, DEFAULT_POLICY, null);
-  assert.ok(state.cooldowns[poolIdOf()]! > now);
+  assert.equal(state.cooldowns[poolIdOf()], undefined);
   assert.equal(state.blacklist[tokenKey(0)].reason, 'HONEYPOT detected on exit');
   assert.equal(state.blacklist[tokenKey(1)], undefined);
   assert.equal(state.lessons[0]!.outcome, 'risk-exit');
 });
 
-test('recordClosedOutcome applies pool cooldown + blacklist on loss + accumulates daily loss', () => {
+test('recordClosedOutcome records loss without creating a pool cooldown and accumulates daily loss', () => {
   const obs = demoObservations()[0]!;
   const now = obs.state.observedAt;
   const state = {
@@ -262,7 +274,7 @@ test('recordClosedOutcome applies pool cooldown + blacklist on loss + accumulate
     dailyRealizedLossUsd: {} as Record<string, number>,
   };
   recordClosedOutcome(state, obs, 'p', 'market down', now, DEFAULT_POLICY, -10);
-  assert.ok(state.cooldowns[poolIdOf()]! > now);
+  assert.equal(state.cooldowns[poolIdOf()], undefined);
   assert.equal(state.lessons[0]!.outcome, 'loss');
   const day = new Date(now * 1000).toISOString().slice(0, 10);
   assert.equal(state.dailyRealizedLossUsd[day], 10);
@@ -289,26 +301,28 @@ test('FAR_ABOVE_RANGE close within the configured loss grace does not blacklist 
   const obs = demoObservations()[0]!;
   const now = obs.state.observedAt;
   const state = {
-    version: 1 as const, positions: [{ ...makeLivePosition(), id: 'p' }], transactions: [], cooldowns: {} as Record<string, number>,
+    version: 1 as const, positions: [{ ...makeLivePosition({ entryPrincipalUsd: 10 }), id: 'p' }], transactions: [], cooldowns: {} as Record<string, number>,
     blacklist: {} as Record<string, { until: number; reason: string }>,
     lessons: [] as Array<{ at: number; chainId: ChainId; poolIdentity: string; outcome: 'win' | 'loss' | 'risk-exit'; pnlUsd: number | null; reason: string }>,
     dailyRealizedLossUsd: {} as Record<string, number>,
   };
   recordClosedOutcome(state, obs, 'p', 'FAR_ABOVE_RANGE', now, DEFAULT_POLICY, -0.2);
+  assert.equal(state.cooldowns[poolIdOf()], undefined);
   assert.equal(state.blacklist[tokenKey(0)], undefined);
   assert.equal(state.blacklist[tokenKey(1)], undefined);
 });
 
-test('FAR_ABOVE_RANGE close beyond the configured loss grace still blacklists the token', () => {
+test('ordinary close below the configured loss grace still blacklists the token', () => {
   const obs = demoObservations()[0]!;
   const now = obs.state.observedAt;
   const state = {
-    version: 1 as const, positions: [{ ...makeLivePosition(), id: 'p' }], transactions: [], cooldowns: {} as Record<string, number>,
+    version: 1 as const, positions: [{ ...makeLivePosition({ entryPrincipalUsd: 10 }), id: 'p' }], transactions: [], cooldowns: {} as Record<string, number>,
     blacklist: {} as Record<string, { until: number; reason: string }>,
     lessons: [] as Array<{ at: number; chainId: ChainId; poolIdentity: string; outcome: 'win' | 'loss' | 'risk-exit'; pnlUsd: number | null; reason: string }>,
     dailyRealizedLossUsd: {} as Record<string, number>,
   };
-  recordClosedOutcome(state, obs, 'p', 'FAR_ABOVE_RANGE', now, DEFAULT_POLICY, -1);
+  recordClosedOutcome(state, obs, 'p', 'FAR_ABOVE_RANGE', now, DEFAULT_POLICY, -4);
+  assert.equal(state.cooldowns[poolIdOf()], undefined);
   assert.ok(Object.keys(state.blacklist).length > 0);
 });
 
@@ -336,14 +350,14 @@ test('canonical PnL uses percentage points exactly once', () => {
   assert.equal(pnlPctFromValues(100.0416, 0), null);
 });
 
-test('primary-stable quote-only positions use live principal as their PnL baseline', () => {
+test('primary-stable quote-only positions require persisted entry basis', () => {
   const stable = '0x0000000000000000000000000000000000000001';
   const token = '0x0000000000000000000000000000000000000002';
   assert.equal(isPrimaryStableQuoteOnly({ token0Address: token, token1Address: stable, amount0: 0n, amount1: 9_676_100n, primaryStable: stable }), true);
   const baseline = effectivePnlDepositUsd({ persistedDepositUsd: 9.83767, principalValueUsd: 9.6761,
     token0Address: token, token1Address: stable, amount0: 0n, amount1: 9_676_100n, primaryStable: stable });
-  assert.equal(baseline, 9.6761);
-  assert.equal(pnlPctFromValues(9.6761, baseline), 0);
+  assert.equal(baseline, null);
+  assert.equal(pnlPctFromValues(9.6761, baseline), null);
 });
 
 test('post-mint entry principal overrides the transfer budget for every PnL consumer', () => {
@@ -359,7 +373,7 @@ test('post-mint entry principal overrides the transfer budget for every PnL cons
 
 test('management PnL reuses actual V3 NFT liquidity already fetched for fee accounting', () => {
   const observation = demoObservations()[0]!;
-  const position = makeLivePosition({ entryPrincipalUsd: null });
+  const position = makeLivePosition({ entryPrincipalUsd: 10 });
   const planned = managementPrincipalValue(position, observation, DEFAULT_POLICY, observation.state.observedAt)!;
   const actualLiquidity = position.plan.liquidity * 2n;
   const enrichedObservation = { ...observation, positionLiquidity: actualLiquidity };
@@ -369,23 +383,27 @@ test('management PnL reuses actual V3 NFT liquidity already fetched for fee acco
   // liquidity-driven increase without relying on an exact floating ratio.
   assert.ok(actual.valueUsd > planned.valueUsd * 1.5);
   assert.ok(Math.abs(managementPrincipalPnlPct(position, enrichedObservation, DEFAULT_POLICY, observation.state.observedAt)! -
-    pnlPctFromValues(actual.valueUsd, position.plan.depositUsd)!) < 1e-12);
+    pnlPctFromValues(actual.valueUsd, position.entryPrincipalUsd)!) < 1e-12);
 });
 
-test('close notification uses canonical fee-inclusive management PnL instead of a mismatched receipt fallback', () => {
+test('close notification uses receipt PnL with the persisted entry principal', () => {
   const obs = demoObservations()[0]!;
   const position = makeLivePosition({ entryPrincipalUsd: 20 });
   const canonical = closeNotificationPnlPct(position, obs, DEFAULT_POLICY, obs.state.observedAt, -1);
-  assert.notEqual(canonical, null);
-  assert.notEqual(canonical, -5);
-  assert.equal(closeNotificationPnlPct(position, obs, DEFAULT_POLICY, obs.state.observedAt, -1), canonical);
+  assert.equal(canonical, -5);
+});
+
+test('fixed-size entry principal remains the configured size for receipt PnL', () => {
+  const obs = demoObservations()[0]!;
+  const position = makeLivePosition({ entryPrincipalUsd: 10 });
+  assert.equal(closeNotificationPnlPct(position, obs, DEFAULT_POLICY, obs.state.observedAt, -0.2), -2);
 });
 
 test('FAR_ABOVE_RANGE close notification uses quote-only principal baseline when fee evidence is unavailable', () => {
   const v4Observation = demoObservations().find(o => o.state.pool.chainId === 4663 && o.state.pool.protocol === 'v4')!;
   const stable = getChain(v4Observation.state.pool.chainId).primaryStable;
   const position = makeLivePosition({
-    entryPrincipalUsd: null,
+    entryPrincipalUsd: 1,
     pool: v4Observation.state.pool,
     plan: {
       ...makeLivePosition().plan,
@@ -402,8 +420,37 @@ test('FAR_ABOVE_RANGE close notification uses quote-only principal baseline when
   (observation as any).feeEvidence = false;
   (observation as any).feeUsd = null;
   const principalOnly = managementPrincipalPnlPct(position, observation, DEFAULT_POLICY, observation.state.observedAt);
-  assert.equal(principalOnly, 0);
-  assert.equal(closeNotificationPnlPct(position, observation, DEFAULT_POLICY, observation.state.observedAt, -0.4, 'FAR_ABOVE_RANGE'), 0);
+  assert.ok(principalOnly !== null);
+  assert.equal(closeNotificationPnlPct(position, observation, DEFAULT_POLICY, observation.state.observedAt, null, 'FAR_ABOVE_RANGE'), principalOnly);
+});
+
+test('ordinary close reasons within the -3% grace do not blacklist the token', () => {
+  const obs = demoObservations()[0]!;
+  const now = obs.state.observedAt;
+  const makeState = () => ({
+    version: 1 as const,
+    positions: [{ ...makeLivePosition({ entryPrincipalUsd: 1 }), id: 'p' }],
+    transactions: [],
+    cooldowns: {} as Record<string, number>,
+    blacklist: {} as Record<string, { until: number; reason: string }>,
+    lessons: [] as Array<{ at: number; chainId: ChainId; poolIdentity: string; outcome: 'win' | 'loss' | 'risk-exit'; pnlUsd: number | null; reason: string }>,
+    dailyRealizedLossUsd: {} as Record<string, number>,
+  });
+  const timeoutState = makeState();
+  recordClosedOutcome(timeoutState, obs, 'p', 'OUT_OF_RANGE_TIMEOUT', now, DEFAULT_POLICY, -0.02);
+  assert.equal(Object.keys(timeoutState.blacklist).length, 0);
+  const manualState = makeState();
+  recordClosedOutcome(manualState, obs, 'p', 'MANUAL', now, DEFAULT_POLICY, -0.02);
+  assert.equal(Object.keys(manualState.blacklist).length, 0);
+});
+
+test('post-close normalization is suppressed when canonical PnL displays as zero', () => {
+  assert.equal(shouldAttemptPostCloseNormalization(0), false);
+  assert.equal(shouldAttemptPostCloseNormalization(0.0049), false);
+  assert.equal(shouldAttemptPostCloseNormalization(-0.0049), false);
+  assert.equal(shouldAttemptPostCloseNormalization(0.005), true);
+  assert.equal(shouldAttemptPostCloseNormalization(9.4891), true);
+  assert.equal(shouldAttemptPostCloseNormalization(null), true);
 });
 
 test('liveManagementDecision refuses claim when lifecycle cost is null (fail-closed)', () => {

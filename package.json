@@ -8,7 +8,6 @@
   "main": "build/viero/cli.js",
   "files": [
     "build/",
-    "bin/",
     "README.md",
     "LICENSE"
   ],
@@ -23,6 +22,7 @@
     "agent:indexer": "tsx src/viero/indexer/server.ts",
     "agent:preflight": "node build/viero/cli.js preflight",
     "agent:prod": "node build/viero/cli.js watch",
+    "operation:recovery": "tsx src/viero/storage/recoveryCli.ts",
     "release:viero": "bash deploy/package-release.sh",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",
@@ -61,7 +61,7 @@
   "author": "pesalxyz",
   "license": "MIT",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=24.15.0"
   },
   "repository": {
     "type": "git",

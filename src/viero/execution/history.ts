@@ -17,7 +17,10 @@ export function historicalRejections(candidate: Candidate, observation: Observat
     .filter(asset => !trusted.has(asset.token.toLowerCase()))
     .map(asset => asset.token.toLowerCase()));
   if (candidateBaseTokens.some(token => existingBaseTokens.includes(token.toLowerCase()))) codes.push({ code: 'DUPLICATE_TOKEN_EXPOSURE', detail: 'An open position already uses the candidate token' });
-  if ((state.cooldowns[identity] ?? 0) > now) codes.push({ code: 'POOL_COOLDOWN', detail: `Pool cooldown active until ${state.cooldowns[identity]}` });
+  // A previously closed position must not suppress a new opportunity solely
+  // because it used the same pool.  In particular, FAR_ABOVE_RANGE is a
+  // range-management exit and the token may be selected again on the next
+  // cycle.  Candidate-attempt cooldowns remain separate in token memory.
   for (const token of tokens) {
     // LP-management outcomes belong to the candidate/base asset. Trusted
     // infrastructure quote assets must never block unrelated pools.
@@ -34,11 +37,17 @@ export function recordClosedOutcome(state: StrategyState, observation: Observati
   const position = state.positions.find(item => item.id === positionId);
   if (!position) throw new Error('POSITION_NOT_FOUND');
   const identity = poolIdentity(position.pool), riskExit = /HONEYPOT|ADMIN|SELL|RISK|DEPTH|PRICE/i.test(reason), loss = pnlUsd !== null && pnlUsd < 0;
-  const closeBasisUsd = position.entryPrincipalUsd ?? position.plan.depositUsd;
-  const realizedPnlPct = pnlUsd !== null && closeBasisUsd > 0 ? pnlUsd / closeBasisUsd * 100 : null;
-  const farAboveGrace = reason === 'FAR_ABOVE_RANGE' && realizedPnlPct !== null && realizedPnlPct >= policy.farAboveRangeBlacklistGracePct;
-  state.cooldowns[identity] = now + policy.poolCooldownSeconds;
-  if (riskExit || (loss && !farAboveGrace)) {
+  const closeBasisUsd = position.entryPrincipalUsd;
+  const realizedPnlPct = pnlUsd !== null && closeBasisUsd != null && closeBasisUsd > 0 ? pnlUsd / closeBasisUsd * 100 : null;
+  // Without a persisted receipt-derived entry basis, do not infer a loss from
+  // a USD amount supplied by a caller. Unknown cost basis is non-actionable.
+  const lossWithinGrace = realizedPnlPct === null || realizedPnlPct >= policy.farAboveRangeBlacklistGracePct;
+  // Do not create a post-close pool cooldown.  Closed-position outcomes are
+  // still recorded for blacklist/loss accounting, but a token closed by a
+  // management rule can be reconsidered immediately.
+  // Apply the configured -3% loss grace consistently to every ordinary close
+  // reason, not only FAR_ABOVE_RANGE. Explicit risk exits remain fail-closed.
+  if (riskExit || (loss && !lossWithinGrace)) {
     const chain = getChain(position.chainId);
     const trusted = new Set([chain.primaryStable, chain.wrappedNative].filter(Boolean).map((address) => address!.toLowerCase()));
     // Deposit assets are normally quote-only, so derive the candidate/base

@@ -18,7 +18,7 @@ import { TelegramBot, telegramConfigFromEnv } from './telegram.js';
 import { AgentRunRetrieval } from './agent/retrieval.js';
 import { DecisionExplainer } from './agent/explainer.js';
 import { CandidateAnalyst } from './agent/analyst.js';
-import { createLlmClient } from './agent/llmClient.js';
+import { createOptionalLlmClient } from './agent/llmClient.js';
 import { ConversationalHandler } from './telegram/conversational.js';
 import { SignerClient } from './execution/signerClient.js';
 import { selectedRuntimeChains } from './runtime/chainSelection.js';
@@ -65,7 +65,10 @@ async function main() {
   }
   try {
     const signer = command === 'live' || command === 'telegram' ? new SignerClient() : undefined;
-    const strategyLlm = command === 'live' || command === 'telegram' ? createLlmClient() : undefined;
+    // Deterministic discovery, planning, and management do not require an
+    // LLM. Telegram conversational analysis is constructed only when its
+    // optional credentials are explicitly configured.
+    const strategyLlm = command === 'telegram' ? createOptionalLlmClient() : undefined;
     const agent = new Agent(policy, repo, undefined, signer, strategyLlm);
     const seeds = values.seeds ? z.array(poolSchema).parse(JSON.parse(await readFile(values.seeds, 'utf8'))) : [];
     const tokenLimit = z.coerce.number().int().min(1).max(100).parse(values['token-limit'] ?? 3);
@@ -157,18 +160,17 @@ async function main() {
       process.once('SIGINT', stop); process.once('SIGTERM', stop);
       try {
         console.error(`Telegram bot started for ${allowedUserIds.size} allowed user(s).`);
-        // Viero is LLM-first: an API key (and a reachable base URL,
-        // defaulting to OpenRouter) are required. createLlmClient throws
-        // LLM_NOT_CONFIGURED when VIERO_LLM_API_KEY is missing.
-        const llmClient = strategyLlm!;
-        const explainer = new DecisionExplainer(llmClient);
-        const analyst = new CandidateAnalyst(llmClient);
-        const retrieval = new AgentRunRetrieval(repo);
-        const conversational = new ConversationalHandler({ retrieval, explainer, analyst, llmClient });
-        conversational.emitStartupBanner();
+        const conversational = strategyLlm ? (() => {
+          const explainer = new DecisionExplainer(strategyLlm);
+          const analyst = new CandidateAnalyst(strategyLlm);
+          const retrieval = new AgentRunRetrieval(repo);
+          const handler = new ConversationalHandler({ retrieval, explainer, analyst, llmClient: strategyLlm });
+          handler.emitStartupBanner();
+          return handler;
+        })() : undefined;
         await new TelegramBot({ token, allowedUserIds, agent, repo, chains: selected, tokenLimit, poolLimit, scanFrom,
           intervalSeconds: policy.screeningIntervalSeconds, signal: abort.signal,
-          conversational, reportLlm: llmClient }).start();
+          conversational, reportLlm: strategyLlm }).start();
       } finally { process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); }
       return;
     }

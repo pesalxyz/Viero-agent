@@ -14,21 +14,22 @@ fi
 apt-get update
 apt-get install -y ca-certificates curl gnupg
 
-if (( node_major < 20 )); then
+node_sqlite_ok=false
+if command -v node >/dev/null 2>&1 && node -e "const [major, minor] = process.versions.node.split('.').map(Number); process.exit(major > 24 || (major === 24 && minor >= 15) ? 0 : 1)"; then node_sqlite_ok=true; fi
+if ! $node_sqlite_ok; then
   install -d -m 0755 /etc/apt/keyrings
   key_tmp="$(mktemp)"
   trap 'rm -f "$key_tmp"' EXIT
   curl --fail --silent --show-error --location https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key --output "$key_tmp"
   gpg --batch --yes --dearmor --output /etc/apt/keyrings/nodesource.gpg "$key_tmp"
-  printf '%s\n' 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main' \
+  printf '%s\n' 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_24.x nodistro main' \
     > /etc/apt/sources.list.d/nodesource.list
   apt-get update
   apt-get install -y nodejs
 fi
 
-node_major="$(node --version | sed -E 's/^v([0-9]+).*/\1/')"
-if (( node_major < 20 )); then
-  printf 'Node 20 or newer is required; found %s\n' "$(node --version)" >&2
+if ! node -e "const [major, minor] = process.versions.node.split('.').map(Number); process.exit(major > 24 || (major === 24 && minor >= 15) ? 0 : 1)"; then
+  printf 'Node 24.15 or newer is required; found %s\n' "$(node --version)" >&2
   exit 69
 fi
 

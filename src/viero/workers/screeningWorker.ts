@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { type Address, formatUnits } from 'viem';
+import { decodeEventLog, zeroAddress, type Address, formatUnits } from 'viem';
 import { type Observation, type Mode, type ChainId, type PoolRef, type Price, type Risk, poolIdentity, tokenIdentity, errorMessage, observationSchema, addressSchema } from '../domain.js';
 import { DEPLOYMENT_VERSION, getChain } from '../config/chains.js';
 import { POLICY_VERSION, type Policy } from '../config/policy.js';
@@ -7,15 +7,16 @@ import { PublicClients, smokeTest } from '../clients/publicClients.js';
 import { Gmgn, Market, Providers } from '../adapters/providers.js';
 import { Indexer } from '../adapters/indexer.js';
 import { verifyPool } from '../adapters/pools.js';
-import { targetedRpcObservation, lightweightManagementObservation } from '../adapters/events.js';
+import { BlockBoundaryCache, targetedRpcObservation, lightweightManagementObservation } from '../adapters/events.js';
 import { type DiscoveryResult } from './discoveryWorker.js';
 import { TokenDiscovery } from '../discovery/tokenDiscovery.js';
 import { dexScreenerShortlist, searchVerifiedPoolsForToken, type ExternalPoolShortlist } from '../adapters/targetedPoolDiscovery.js';
 import { canonicalPrice, rank, screen } from '../screening/pipeline.js';
 import { amount0Delta, amount1Delta, humanQuotePriceFromSqrt, sqrtAtTick, tokenValue } from '../screening/math.js';
-import { v3PositionManagerAbi, v4PositionManagerAbi, stateViewAbi, v3Abi } from '../adapters/abi.js';
+import { erc721TransferEvent, v3PositionManagerAbi, v4PositionManagerAbi, stateViewAbi, v3Abi } from '../adapters/abi.js';
 import { selectCandidate, PROMPT_VERSION, type DecisionModel } from '../agent/runtime.js';
 import { InsufficientQuoteBalanceError, planPosition, type PortfolioLimits } from '../execution/planner.js';
+import { decodeOutgoingErc20Transfers } from '../execution/executor.js';
 import { ChainSupervisor } from '../execution/guard.js';
 import { type Repository, type AgentRun } from '../storage/repositories.js';
 import { type PaperPosition, markPaperPosition, openPaperPosition } from '../management/paper.js';
@@ -56,6 +57,14 @@ export function closeNotificationPnlPct(
   realizedPnlUsd: number | null | undefined,
   reason?: string,
 ): number | null {
+  // A confirmed close has receipt-based proceeds. Use that same realized
+  // result for the Telegram final PnL so the notification cannot disagree
+  // with the close receipt. The entry principal is the operator's configured
+  // fixed/auto size, persisted at open time.
+  const basis = position.entryPrincipalUsd;
+  if (realizedPnlUsd != null && Number.isFinite(realizedPnlUsd) && basis != null && basis > 0) {
+    return realizedPnlUsd / basis * 100;
+  }
   const canonical = managementPnlPct(position, observation, policy, now);
   if (canonical != null) return canonical;
   // FAR_ABOVE_RANGE is independently actionable and must not display a
@@ -67,10 +76,19 @@ export function closeNotificationPnlPct(
     const principalOnly = managementPrincipalPnlPct(position, observation, policy, now);
     if (principalOnly != null) return principalOnly;
   }
-  const basis = position.entryPrincipalUsd ?? position.plan.depositUsd;
-  return realizedPnlUsd != null && Number.isFinite(realizedPnlUsd) && basis > 0
+  return realizedPnlUsd != null && Number.isFinite(realizedPnlUsd) && basis != null && basis > 0
     ? realizedPnlUsd / basis * 100
     : null;
+}
+
+/**
+ * Telegram renders PnL to two decimal places.  A close that displays as
+ * +0.00%/-0.00% must not hand residual inventory to Relay automatically.
+ * Unknown PnL remains eligible for the normal balance-based normalization
+ * check; only a known displayed-zero result is suppressed.
+ */
+export function shouldAttemptPostCloseNormalization(pnlPct: number | null): boolean {
+  return pnlPct === null || Number(pnlPct.toFixed(2)) !== 0;
 }
 
 export type TvlRankedPool<T = unknown> = { pool: PoolRef; tvlUsd: number | null; value: T };
@@ -179,6 +197,7 @@ export class Agent {
 
   async cycle(options: { mode: Mode; observations?: Observation[]; now?: number; chains?: ChainId[]; seeds?: PoolRef[]; tokenLimit?: number; poolLimit?: number; scanFrom?: bigint; persist?: boolean }): Promise<AgentRun> {
     const now = options.now ?? Date.now() / 1000;
+    const boundaries = new BlockBoundaryCache();
     this.cyclePositionObservations.clear();
     const run: AgentRun = { id: randomUUID(), mode: options.mode, startedAt: now, finishedAt: now,
       configVersion: POLICY_VERSION, deploymentVersion: DEPLOYMENT_VERSION, policy: this.policy,
@@ -221,7 +240,11 @@ export class Agent {
           const eligibility = entries.map(entry => {
             const key = `${chainId}:${entry.address.toLowerCase()}`;
             const blacklisted = state.blacklist[key] && state.blacklist[key].until > nowSeconds;
-            const cooldown = (state.cooldowns[key] && state.cooldowns[key] > nowSeconds) || (tokenMemory[key]?.cooldownUntil !== undefined && tokenMemory[key]!.cooldownUntil! > nowSeconds);
+            // Closed-position pool cooldowns are intentionally not an
+            // eligibility gate.  A token closed by FAR_ABOVE_RANGE (or
+            // another management outcome) may be selected again immediately.
+            // Candidate-attempt cooldowns remain enforced via token memory.
+            const cooldown = tokenMemory[key]?.cooldownUntil !== undefined && tokenMemory[key]!.cooldownUntil! > nowSeconds;
             const open = openTokenSet.has(key) && state.positions.some(position => position.status === 'open' && position.plan.depositAssets.some(asset => `${chainId}:${asset.token.toLowerCase()}` === key));
             const closing = openTokenSet.has(key) && state.positions.some(position => position.status === 'closing' && position.plan.depositAssets.some(asset => `${chainId}:${asset.token.toLowerCase()}` === key));
             const reason = blacklisted ? 'BLACKLISTED' : cooldown ? 'COOLDOWN' : open ? 'OPEN_POSITION' : closing ? 'CLOSING_POSITION' : 'none';
@@ -333,7 +356,7 @@ export class Agent {
       const memoryEntry = tokenMemory[memoryKey];
       if (memoryEntry) { memoryEntry.candidateAttempts += 1; memoryEntry.lastAttemptAt = Date.now() / 1000; memoryEntry.lastAttemptResult = 'HANDED_OFF'; memoryEntry.lastPoolId = selected.poolId; await this.tokenMemory.save(tokenMemory); }
       if (run.candidateHandoff) run.candidateHandoff.status = 'EXECUTED';
-      await this.executeCandidateToken({ chainId: selected.chainId, tokenAddress: selected.tokenAddress, mode: options.mode as Extract<Mode, 'live-execution' | 'live-readonly'>, run, dexShortlist: selectedDexShortlist });
+      await this.executeCandidateToken({ chainId: selected.chainId, tokenAddress: selected.tokenAddress, mode: options.mode as Extract<Mode, 'live-execution' | 'live-readonly'>, run, dexShortlist: selectedDexShortlist, boundaries });
     } else if (passCount > 0) { if (run.candidateHandoff && run.candidateHandoff.status !== 'SKIPPED') { run.candidateHandoff.status = 'SKIPPED'; run.candidateHandoff.reason = preExecutionControls.botState !== 'RUNNING' ? 'BOT_STOPPED' : null; } console.error(`[viero.candidate-selection] pass=${passCount} eligible=${eligibleCount} selected=none selected_address=none`); }
     run.finishedAt = options.mode === 'replay' ? now : Date.now() / 1000;
     // Some lightweight discovery/test repositories do not expose strategyState;
@@ -350,7 +373,7 @@ export class Agent {
           this.cyclePositionObservations.set(position.id, enriched.observation as Observation);
           const feeUsd = enriched.feeUsd ?? null;
           const pnlBase = feeUsd != null && enriched.valueUsd != null ? enriched.valueUsd + feeUsd : enriched.valueUsd;
-          const pnlDepositUsd = effectivePnlDepositUsd({ persistedDepositUsd: position.plan.depositUsd, entryPrincipalUsd: position.entryPrincipalUsd, principalValueUsd: enriched.valueUsd ?? null,
+          const pnlDepositUsd = effectivePnlDepositUsd({ persistedDepositUsd: position.plan.depositUsd, entryPrincipalUsd: enriched.entryPrincipalUsd ?? position.entryPrincipalUsd, principalValueUsd: enriched.valueUsd ?? null,
             token0Address: enriched.token0?.address, token1Address: enriched.token1?.address, amount0: enriched.amount0, amount1: enriched.amount1,
             primaryStable: getChain(position.chainId).primaryStable });
           const pnlPct = pnlPctFromValues(pnlBase, pnlDepositUsd);
@@ -427,7 +450,7 @@ export class Agent {
    * Caller supplies the AgentRun to attach the result to. Caller is
    * responsible for setting the run.id and run.startedAt.
    */
-  async executeCandidateToken(input: { chainId: ChainId; tokenAddress: Address; mode: Extract<Mode, 'live-execution' | 'live-readonly'>; run: AgentRun; dexShortlist?: ExternalPoolShortlist }): Promise<AgentRun> {
+  async executeCandidateToken(input: { chainId: ChainId; tokenAddress: Address; mode: Extract<Mode, 'live-execution' | 'live-readonly'>; run: AgentRun; dexShortlist?: ExternalPoolShortlist; boundaries?: BlockBoundaryCache }): Promise<AgentRun> {
     const { chainId, tokenAddress, mode, run } = input;
     run.startedAt = run.startedAt ?? (Date.now() / 1000);
     run.finishedAt = run.startedAt;
@@ -445,6 +468,7 @@ export class Agent {
     run.providerObservations ??= [];
     run.errors ??= [];
     run.status ??= 'ok';
+    this.clients.telemetry.candidateObserved();
     const now = Date.now() / 1000;
     try {
       const controls = await this.repository.controls();
@@ -452,12 +476,12 @@ export class Agent {
       assertLiveExecutionEnabled(mode);
       this.supervisor.assertActive(chainId);
       if (!this.checkedDeployments.has(chainId)) {
-        const smoke = await smokeTest(this.clients, chainId);
+        const smoke = await this.clients.telemetry.run('preflight', () => smokeTest(this.clients, chainId));
         if (!smoke.ok) throw new Error(`DEPLOYMENT_SMOKE_FAILED: ${smoke.checks.filter(check => !check.ok).map(check => check.address).join(',')}`);
         this.checkedDeployments.add(chainId);
       }
       // Search both protocols completely before choosing by external USD TVL.
-      const search = await searchVerifiedPoolsForToken(this.clients.get(chainId), chainId, tokenAddress, { dex: input.dexShortlist });
+      const search = await this.clients.telemetry.run('candidate-discovery', () => searchVerifiedPoolsForToken(this.clients.get(chainId), chainId, tokenAddress, { dex: input.dexShortlist }));
       run.poolDiscovery = search.evidence;
       const shortlist = search.pools;
       console.error(`[viero.pool-discovery] graphql_v4=${search.evidence.graphqlV4Hints.length} dex_v4=${search.evidence.dexV4Hints.length} dex_v3=${search.evidence.dexV3Hints.length} gecko_v3=${search.evidence.geckoV3Hints.length} verified=${shortlist.length} selected=${search.evidence.selectedPool ?? 'none'}`);
@@ -474,7 +498,7 @@ export class Agent {
 
       // Step 2: on-chain verifyPool (RPC).
       const head = await this.clients.get(chainId).getBlockNumber({ cacheTime: 0 });
-      const state = await verifyPool(this.clients.get(chainId), poolRef, head);
+      const state = await this.clients.telemetry.run('candidate-verify', () => verifyPool(this.clients.get(chainId), poolRef, head));
 
       // Step 3: GMGN prices for both pool tokens.
       const prices = (await Promise.all([state.token0, state.token1].map(t => this.market.prices(chainId, t.address)))).flat();
@@ -487,7 +511,7 @@ export class Agent {
       const chain = getChain(chainId);
       const nativeUsd = chain.native.isErc20Backed ? 1 : chain.wrappedNative
         ? (await this.market.prices(chainId, chain.wrappedNative))[0]?.usd ?? null : null;
-      const observation = await targetedRpcObservation(this.clients.get(chainId), state, prices, this.policy.windowMinutes, nativeUsd);
+      const observation = await this.clients.telemetry.run('candidate-observation', () => targetedRpcObservation(this.clients.get(chainId), state, prices, this.policy.windowMinutes, nativeUsd, undefined, input.boundaries));
       for (const risk of risks) if (!observation.risks.some((existing) => existing.token === risk.token)) observation.risks.push(risk);
       const finalNow = Date.now() / 1000;
       const candidate = screen(observation, this.policy, finalNow, { tokenVolume1h: run.selectedTokenVolume1h }); // token-level GMGN volume is authoritative
@@ -534,14 +558,21 @@ export class Agent {
         const tokenPrices = new Map(state ? [state.token0, state.token1].map(token => [token.address,
           canonicalPrice(observation.prices, token.address, now, this.policy)?.usd ?? null] as const) : []);
         const chainConfig = getChain(chainId);
-        const quoteToken = [state.token0, state.token1].find(token => token.address.toLowerCase() === chainConfig.primaryStable.toLowerCase()
-          || token.address.toLowerCase() === chainConfig.wrappedNative?.toLowerCase());
+        const poolAddresses = [state.token0.address.toLowerCase(), state.token1.address.toLowerCase()];
+        const hasNativeQuote = Boolean(chainConfig.wrappedNative && poolAddresses.includes(chainConfig.wrappedNative.toLowerCase()));
+        const hasStableQuote = poolAddresses.includes(chainConfig.primaryStable.toLowerCase());
+        const savedPreference = controls.fixedQuoteByChain?.[chainId] ?? 'STABLE';
+        const quotePreference: 'NATIVE' | 'STABLE' = hasNativeQuote && hasStableQuote
+          ? savedPreference : hasNativeQuote ? 'NATIVE' : 'STABLE';
+        const preferredQuoteAddress = quotePreference === 'NATIVE' ? chainConfig.wrappedNative : chainConfig.primaryStable;
+        const quoteToken = [state.token0, state.token1].find(token => token.address.toLowerCase() === preferredQuoteAddress?.toLowerCase());
         const availableExecutionBalanceUsd = wallet && quoteToken ? (() => {
           const price = tokenPrices.get(quoteToken.address), amount = wallet.tokens.get(quoteToken.address);
+          if (quotePreference === 'NATIVE') return Number(wallet.native) / 10 ** chainConfig.native.decimals * (price ?? 1);
           return price != null && amount !== undefined ? Number(amount) / 10 ** quoteToken.decimals * price : null;
         })() : null;
         const settings = await resolveExecutionSettings({
-          controls, chainId, llm: this.strategyLlm,
+          controls, chainId, quoteAsset: quotePreference, llm: this.strategyLlm,
           sizeContext: {
             walletEquityUsd: availableExecutionBalanceUsd === null ? null : availableExecutionBalanceUsd + exposure.totalExposureUsd,
             availableExecutionBalanceUsd,
@@ -567,21 +598,13 @@ export class Agent {
         exposure.chainExposureUsd[chainId] = (exposure.chainExposureUsd[chainId] ?? 0) + decision.plan.depositUsd;
         if (mode === 'live-execution') {
           const executed = await this.signer!.open(decision.plan, observation, this.policy);
-          // The planner's depositUsd is a transfer/budget bound.  A mint can
-          // consume less (for example when the entry state moves during the
-          // transaction), so capture the actual principal immediately after
-          // the confirmed mint and use it as the canonical PnL cost basis.
-          let openedPosition = executed.value;
-          try {
-            const enriched = openedPosition.pool.protocol === 'v4'
-              ? await this.enrichV4Position(openedPosition)
-              : await this.enrichV3Position(openedPosition);
-            if (enriched.valueUsd != null && Number.isFinite(enriched.valueUsd) && enriched.valueUsd > 0) {
-              openedPosition = { ...openedPosition, entryPrincipalUsd: enriched.valueUsd };
-            }
-          } catch (error) {
-            console.error(`[viero.execution] post-mint principal observation unavailable: ${errorMessage(error)}`);
-          }
+          // Prefer the principal actually transferred in the confirmed mint
+          // receipt.  This keeps management/Telegram PnL aligned with the
+          // on-chain entry when a pool consumes less than the requested cap.
+          // PnL/management must use only the receipt-derived basis persisted by
+          // the executor. Never substitute the requested budget when evidence
+          // is unavailable.
+          const openedPosition = { ...executed.value, entryPrincipalUsd: executed.value.entryPrincipalUsd ?? null };
           strategy!.positions.push(openedPosition); strategy!.transactions.push(...executed.transactions);
           strategy!.transactions = strategy!.transactions.slice(-5000);
           decision.transactionHashes = executed.transactions.map((t) => t.hash);
@@ -593,6 +616,10 @@ export class Agent {
             strategy!.managementNotifications = strategy!.managementNotifications.slice(-500);
           }
           await this.repository.setStrategyState(strategy!);
+          // The signer marks the mint workflow complete only after this durable
+          // agent projection is on disk. A failed acknowledgement is surfaced
+          // (never retried as a new mint) and keeps signer recovery fail-closed.
+          if (mint) await this.signer!.acknowledgePosition(mint.hash as `0x${string}`, openedPosition.id);
           const openedMemory = await this.tokenMemory.load(), openedKey = `${chainId}:${tokenAddress.toLowerCase()}`;
           const openedEntry = openedMemory[openedKey];
           if (openedEntry) { openedEntry.successfulOpens += 1; openedEntry.lastAttemptResult = 'OPENED'; openedEntry.lastAttemptAt = Date.now() / 1000; await this.tokenMemory.save(openedMemory); }
@@ -619,7 +646,14 @@ export class Agent {
           ...error.details,
           requiredRaw: error.details.requiredRaw.toString(), availableRaw: error.details.availableRaw.toString(),
         }});
-      } else run.errors.push({ chainId, error: failure });
+      } else {
+        const structured = error && typeof error === 'object' ? error as { code?: unknown; details?: unknown } : {};
+        const details = structured.details && typeof structured.details === 'object' ? structured.details as { maximumRaw?: unknown; requiredRaw?: unknown } : undefined;
+        run.errors.push({ chainId, error: failure, ...(typeof structured.code === 'string' ? { code: structured.code } : {}), ...(details ? { details: {
+          ...(typeof details.maximumRaw === 'string' ? { maximumRaw: details.maximumRaw } : {}),
+          ...(typeof details.requiredRaw === 'string' ? { requiredRaw: details.requiredRaw } : {}),
+        } } : {}) });
+      }
       run.status = 'failed';
     }
     run.finishedAt = Date.now() / 1000;
@@ -666,9 +700,9 @@ export class Agent {
       client.readContract({ address: getChain(position.chainId).v4.stateView, abi: stateViewAbi, functionName: 'getPositionInfo', args: [poolId, position.positionManager, position.plan.tickLower, position.plan.tickUpper, `0x${position.tokenId.toString(16).padStart(64, '0')}`] }),
       ]);
       const liquidity = BigInt(stored[0] as bigint), { fee0Raw, fee1Raw } = v4FeeGrowthDelta(BigInt(current[0]), BigInt(current[1]), BigInt(stored[1]), BigInt(stored[2]), liquidity);
-      const prices = [observation.state.token0, observation.state.token1].map(t => canonicalPrice(observation.prices, t.address, Date.now() / 1000, this.policy)?.usd ?? null);
+      const prices = [observation.state.token0, observation.state.token1].map(t => canonicalPrice(observation.prices, t.address, observation.state.observedAt, this.policy)?.usd ?? null);
       const feeUsd = prices[0] == null || prices[1] == null ? null : tokenValue(fee0Raw, observation.state.token0.decimals, prices[0]) + tokenValue(fee1Raw, observation.state.token1.decimals, prices[1]);
-      return Object.assign(observation, { fee0Raw, fee1Raw, feeUsd, fee0Human: formatUnits(fee0Raw, observation.state.token0.decimals), fee1Human: formatUnits(fee1Raw, observation.state.token1.decimals), feeEvidence: feeUsd !== null });
+      return Object.assign(observation, { positionLiquidity: liquidity, fee0Raw, fee1Raw, feeUsd, fee0Human: formatUnits(fee0Raw, observation.state.token0.decimals), fee1Human: formatUnits(fee1Raw, observation.state.token1.decimals), feeEvidence: feeUsd !== null });
     } catch { return Object.assign(observation, { feeEvidence: false, fee0Raw: null, fee1Raw: null, feeUsd: null }); }
   }
   private async attachV3Fees(position: import('../execution/liveState.js').LivePosition, observation: Observation) {
@@ -682,7 +716,7 @@ export class Agent {
       const inside0 = feeGrowthInsideV3(BigInt(global0 as unknown as bigint), BigInt((lower as readonly unknown[])[2] as bigint), BigInt((upper as readonly unknown[])[2] as bigint), observation.state.tick, tickLower, tickUpper);
       const inside1 = feeGrowthInsideV3(BigInt(global1 as unknown as bigint), BigInt((lower as readonly unknown[])[3] as bigint), BigInt((upper as readonly unknown[])[3] as bigint), observation.state.tick, tickLower, tickUpper);
       const fees = v3UnclaimedFees({ tokensOwed0: BigInt(raw[10] as bigint), tokensOwed1: BigInt(raw[11] as bigint), feeGrowthInside0Now: inside0, feeGrowthInside1Now: inside1, feeGrowthInside0Last: BigInt(raw[8] as bigint), feeGrowthInside1Last: BigInt(raw[9] as bigint), liquidity });
-      const prices = [observation.state.token0, observation.state.token1].map(t => canonicalPrice(observation.prices, t.address, Date.now() / 1000, this.policy)?.usd ?? null);
+      const prices = [observation.state.token0, observation.state.token1].map(t => canonicalPrice(observation.prices, t.address, observation.state.observedAt, this.policy)?.usd ?? null);
       const feeUsd = prices[0] == null || prices[1] == null ? null : tokenValue(fees.fee0Raw, observation.state.token0.decimals, prices[0]) + tokenValue(fees.fee1Raw, observation.state.token1.decimals, prices[1]);
       return Object.assign(observation, { positionLiquidity: liquidity, fee0Raw: fees.fee0Raw, fee1Raw: fees.fee1Raw, fee0Human: formatUnits(fees.fee0Raw, observation.state.token0.decimals), fee1Human: formatUnits(fees.fee1Raw, observation.state.token1.decimals), feeUsd, feeEvidence: feeUsd !== null });
     } catch { return Object.assign(observation, { feeEvidence: false, fee0Raw: null, fee1Raw: null, feeUsd: null }); }
@@ -690,6 +724,55 @@ export class Agent {
   private async observePositionLightweight(position: import('../execution/liveState.js').LivePosition) {
     const observed = await this.observePoolLightweight(position.pool);
     return position.pool.protocol === 'v4' ? this.attachV4Fees(position, observed) : this.attachV3Fees(position, observed);
+  }
+  /** Recover the actual quote/token principal from the confirmed mint receipt.
+   * This is a read-only compatibility path for positions opened before the
+   * planner's full-range quote sizing fix; new positions persist this value
+   * directly from the executor. */
+  private async actualEntryPrincipalUsd(position: import('../execution/liveState.js').LivePosition, observation: Observation): Promise<number | null> {
+    try {
+      const receipt = await this.clients.get(position.chainId).getTransactionReceipt({ hash: position.entryTxHash });
+      const allowed = position.plan.depositAssets.map(asset => asset.token);
+      let owner: Address | null = null;
+      for (const log of receipt.logs) {
+        try {
+          const decoded = decodeEventLog({ abi: [erc721TransferEvent], data: log.data, topics: log.topics });
+          if (decoded.eventName === 'Transfer' && decoded.args.from.toLowerCase() === zeroAddress.toLowerCase()) {
+            owner = decoded.args.to as Address;
+            break;
+          }
+        } catch { /* unrelated receipt log */ }
+      }
+      if (!owner) {
+        try {
+          const tx = await this.clients.get(position.chainId).getTransaction({ hash: position.entryTxHash });
+          owner = tx.from as Address;
+        } catch { /* receipt may be available without transaction metadata */ }
+      }
+      if (!owner && this.signer) owner = (await this.signer.health()).address as Address;
+      if (!owner) return position.entryPrincipalUsd ?? null;
+      const sent = decodeOutgoingErc20Transfers(receipt, owner, allowed);
+      if (!sent.size) return position.entryPrincipalUsd ?? null;
+      let total = 0;
+      const primaryStable = getChain(position.chainId).primaryStable.toLowerCase();
+      for (const asset of position.plan.depositAssets) {
+        const amount = sent.get(asset.token.toLowerCase()) ?? 0n;
+        if (amount <= 0n) continue;
+        const token = asset.token.toLowerCase() === observation.state.token0.address.toLowerCase() ? observation.state.token0 : observation.state.token1;
+        // The configured primary stable is the unit of account. Do not let a
+        // missing/stale provider quote prevent receipt reconciliation.
+        const usd = token.address.toLowerCase() === primaryStable
+          ? 1
+          : canonicalPrice(observation.prices, token.address, observation.state.observedAt, this.policy)?.usd ?? null;
+        if (usd == null) return position.entryPrincipalUsd ?? null;
+        total += tokenValue(amount, token.decimals, usd);
+      }
+      if (Number.isFinite(total) && total > 0) {
+        console.error(`[viero.entry-basis] position=${position.id} receipt=${position.entryTxHash} principalUsd=${total}`);
+        return total;
+      }
+      return position.entryPrincipalUsd ?? null;
+    } catch { return position.entryPrincipalUsd ?? null; }
   }
   /**
    * Obtain the same canonical, fee-aware observation used by active-position
@@ -700,6 +783,13 @@ export class Agent {
    */
   private async observeManagementPosition(position: import('../execution/liveState.js').LivePosition, now: number) {
     let observation = await this.observePositionLightweight(position);
+    const actualEntry = await this.actualEntryPrincipalUsd(position, observation);
+    if (actualEntry != null && Math.abs(actualEntry - (position.entryPrincipalUsd ?? actualEntry)) > 0.000001) {
+      position.entryPrincipalUsd = actualEntry;
+      const persisted = await this.repository.strategyState();
+      const persistedPosition = persisted.positions.find(item => item.id === position.id);
+      if (persistedPosition) { persistedPosition.entryPrincipalUsd = actualEntry; await this.repository.setStrategyState(persisted); }
+    }
     if (managementPnlPct(position, observation, this.policy, now) !== null) return observation;
     try {
       const enriched = position.pool.protocol === 'v4'
@@ -722,11 +812,25 @@ export class Agent {
     fresh.prices = prices;
     const fee0Raw = (fresh as Observation & { fee0Raw?: bigint | null }).fee0Raw;
     const fee1Raw = (fresh as Observation & { fee1Raw?: bigint | null }).fee1Raw;
-    if (fee0Raw != null && fee1Raw != null) {
+    // A cycle snapshot is the canonical observation rendered to Telegram and
+    // evaluated by management. If the follow-up RPC read temporarily omits
+    // fee-growth evidence, retain that same evidence instead of turning a
+    // displayed fee-inclusive PnL into "unavailable" during confirmation.
+    const priorEvidence = prior as Observation & { fee0Raw?: bigint | null; fee1Raw?: bigint | null; feeUsd?: number | null; feeEvidence?: boolean };
+    if ((fee0Raw == null || fee1Raw == null) && priorEvidence.feeEvidence === true && priorEvidence.fee0Raw != null && priorEvidence.fee1Raw != null) {
+      Object.assign(fresh, {
+        fee0Raw: priorEvidence.fee0Raw,
+        fee1Raw: priorEvidence.fee1Raw,
+        feeEvidence: true,
+      });
+    }
+    const carriedFee0Raw = (fresh as Observation & { fee0Raw?: bigint | null }).fee0Raw;
+    const carriedFee1Raw = (fresh as Observation & { fee1Raw?: bigint | null }).fee1Raw;
+    if (carriedFee0Raw != null && carriedFee1Raw != null) {
       const p0 = canonicalPrice(prices, fresh.state.token0.address, now, this.policy)?.usd;
       const p1 = canonicalPrice(prices, fresh.state.token1.address, now, this.policy)?.usd;
       if (p0 != null && p1 != null) Object.assign(fresh, {
-        feeUsd: tokenValue(fee0Raw, fresh.state.token0.decimals, p0) + tokenValue(fee1Raw, fresh.state.token1.decimals, p1),
+        feeUsd: tokenValue(carriedFee0Raw, fresh.state.token0.decimals, p0) + tokenValue(carriedFee1Raw, fresh.state.token1.decimals, p1),
         feeEvidence: true,
       });
     }
@@ -736,7 +840,7 @@ export class Agent {
   /** Read-only V3 NFT enrichment for Telegram position cards. */
   async enrichV3Position(position: import('../execution/liveState.js').LivePosition) {
     if (position.pool.protocol !== 'v3') throw new Error('V3_POSITION_REQUIRED');
-    const observation = await this.observePositionLightweight(position);
+        const observation = await this.clients.telemetry.run('management-recovery', () => this.observePositionLightweight(position));
     const client = this.clients.get(position.chainId);
     const raw = await client.readContract({ address: position.positionManager, abi: v3PositionManagerAbi, functionName: 'positions', args: [position.tokenId] }) as readonly unknown[];
     const token0 = observation.state.token0, token1 = observation.state.token1;
@@ -745,7 +849,7 @@ export class Agent {
     const lo = sqrtAtTick(tickLower), hi = sqrtAtTick(tickUpper);
     const amount0 = current <= lo ? amount0Delta(lo, hi, liquidity) : current >= hi ? 0n : amount0Delta(current, hi, liquidity);
     const amount1 = current >= hi ? amount1Delta(lo, hi, liquidity) : current <= lo ? 0n : amount1Delta(lo, current, liquidity);
-    const prices = new Map([token0, token1].map(t => [t.address.toLowerCase(), canonicalPrice(observation.prices, t.address, Date.now() / 1000, this.policy)?.usd ?? null]));
+    const prices = new Map([token0, token1].map(t => [t.address.toLowerCase(), canonicalPrice(observation.prices, t.address, observation.state.observedAt, this.policy)?.usd ?? null]));
     const p0 = prices.get(token0.address.toLowerCase()), p1 = prices.get(token1.address.toLowerCase());
     const valueUsd = p0 != null && p1 != null ? tokenValue(amount0, token0.decimals, p0) + tokenValue(amount1, token1.decimals, p1) : null;
     const chain = getChain(position.chainId), quoteIs0 = token0.address.toLowerCase() === chain.primaryStable.toLowerCase() || token0.address.toLowerCase() === chain.wrappedNative?.toLowerCase();
@@ -753,7 +857,7 @@ export class Agent {
     const quotePrice = prices.get(quote.address.toLowerCase()), basePrice = prices.get(base.address.toLowerCase());
     const human = (sqrt: bigint) => quotePrice && basePrice ? humanQuotePriceFromSqrt({ sqrtPriceX96: sqrt, quoteIsToken0: quoteIs0, decimals0: token0.decimals, decimals1: token1.decimals }) : null;
     const currentPrice = human(current), lowerPrice = human(sqrtAtTick(tickLower)), upperPrice = human(sqrtAtTick(tickUpper));
-    return { observation, token0, token1, liquidity, tickLower, tickUpper, amount0, amount1, valueUsd, fee0: (observation as any).fee0Raw ?? null, fee1: (observation as any).fee1Raw ?? null, fee0Human: (observation as any).fee0Human ?? null, fee1Human: (observation as any).fee1Human ?? null, feeUsd: (observation as any).feeUsd ?? null, feeEvidence: (observation as any).feeEvidence === true,
+    return { observation, token0, token1, liquidity, tickLower, tickUpper, amount0, amount1, valueUsd, entryPrincipalUsd: await this.actualEntryPrincipalUsd(position, observation), fee0: (observation as any).fee0Raw ?? null, fee1: (observation as any).fee1Raw ?? null, fee0Human: (observation as any).fee0Human ?? null, fee1Human: (observation as any).fee1Human ?? null, feeUsd: (observation as any).feeUsd ?? null, feeEvidence: (observation as any).feeEvidence === true,
       currentPrice, lowerPrice, upperPrice, inRange: observation.state.tick >= tickLower && observation.state.tick < tickUpper,
       baseSymbol: base.symbol, quoteSymbol: quote.symbol };
   }
@@ -762,29 +866,29 @@ export class Agent {
     if (position.pool.protocol !== 'v4') throw new Error('V4_POSITION_REQUIRED');
     const observation = await this.observePositionLightweight(position);
     const token0 = observation.state.token0, token1 = observation.state.token1;
-    // Use the verified position liquidity carried by the persisted plan. A
-    // second PositionManager lookup can resolve a different key/slot and was
-    // the source of cycle-only valuation drift; Refresh and management use
-    // this same canonical liquidity input.
-    const liquidity = position.plan.liquidity;
+    // Use the verified NFT position liquidity fetched by attachV4Fees. The
+    // persisted plan is only a compatibility fallback for legacy records.
+    // Refresh, cycle reporting, and management must value the same position.
+    const liquidity = observation.positionLiquidity ?? position.plan.liquidity;
     const tickLower = position.plan.tickLower, tickUpper = position.plan.tickUpper, current = observation.state.sqrtPriceX96;
     const lo = sqrtAtTick(tickLower), hi = sqrtAtTick(tickUpper);
     const amount0 = current <= lo ? amount0Delta(lo, hi, liquidity) : current >= hi ? 0n : amount0Delta(current, hi, liquidity);
     const amount1 = current >= hi ? amount1Delta(lo, hi, liquidity) : current <= lo ? 0n : amount1Delta(lo, current, liquidity);
-    const prices = new Map([token0, token1].map(t => [t.address.toLowerCase(), canonicalPrice(observation.prices, t.address, Date.now() / 1000, this.policy)?.usd ?? null]));
+    const prices = new Map([token0, token1].map(t => [t.address.toLowerCase(), canonicalPrice(observation.prices, t.address, observation.state.observedAt, this.policy)?.usd ?? null]));
     const p0 = prices.get(token0.address.toLowerCase()), p1 = prices.get(token1.address.toLowerCase());
     const valueUsd = p0 != null && p1 != null ? tokenValue(amount0, token0.decimals, p0) + tokenValue(amount1, token1.decimals, p1) : null;
     const chain = getChain(position.chainId), quoteIs0 = token0.address.toLowerCase() === chain.primaryStable.toLowerCase() || token0.address.toLowerCase() === chain.wrappedNative?.toLowerCase();
     const quote = quoteIs0 ? token0 : token1, base = quoteIs0 ? token1 : token0;
     const quotePrice = prices.get(quote.address.toLowerCase()), basePrice = prices.get(base.address.toLowerCase());
     const human = (sqrt: bigint) => quotePrice && basePrice ? humanQuotePriceFromSqrt({ sqrtPriceX96: sqrt, quoteIsToken0: quoteIs0, decimals0: token0.decimals, decimals1: token1.decimals }) : null;
-    return { observation, token0, token1, liquidity, tickLower, tickUpper, amount0, amount1, valueUsd, fee0: (observation as any).fee0Raw ?? null, fee1: (observation as any).fee1Raw ?? null, fee0Human: (observation as any).fee0Human ?? null, fee1Human: (observation as any).fee1Human ?? null, feeUsd: (observation as any).feeUsd ?? null, feeEvidence: (observation as any).feeEvidence === true,
+    return { observation, token0, token1, liquidity, tickLower, tickUpper, amount0, amount1, valueUsd, entryPrincipalUsd: await this.actualEntryPrincipalUsd(position, observation), fee0: (observation as any).fee0Raw ?? null, fee1: (observation as any).fee1Raw ?? null, fee0Human: (observation as any).fee0Human ?? null, fee1Human: (observation as any).fee1Human ?? null, feeUsd: (observation as any).feeUsd ?? null, feeEvidence: (observation as any).feeEvidence === true,
       currentPrice: human(current), lowerPrice: human(lo), upperPrice: human(hi), inRange: observation.state.tick >= tickLower && observation.state.tick < tickUpper,
       baseSymbol: base.symbol, quoteSymbol: quote.symbol };
   }
   async manageLive(now = Date.now() / 1000) {
     if (!this.signer) throw new Error('SIGNER_NOT_CONFIGURED');
     const state = await this.repository.strategyState();
+    this.clients.telemetry.managementTick(state.positions.filter(position => position.status === 'open' || position.status === 'closing').length);
     const positionSymbol = (position: import('../execution/liveState.js').LivePosition, observation?: Observation): string | undefined => {
       const token0 = observation?.state.token0, token1 = observation?.state.token1;
       if (!token0 || !token1) return undefined;
@@ -828,7 +932,7 @@ export class Agent {
           continue;
         }
         try {
-    const observation = await this.observePositionLightweight(position);
+          const observation = await this.clients.telemetry.run('management-recovery', () => this.observePositionLightweight(position));
           const executed = await this.signer.close(position, observation, this.policy, position.lastAction === 'emergency-close');
           state.positions[index] = executed.value; state.transactions.push(...executed.transactions);
           recordClosedOutcome(state, observation, position.id, position.closeReason ?? 'CLOSE_RECOVERY', now, this.policy, executed.value.realizedPnlUsd);
@@ -869,14 +973,17 @@ export class Agent {
         // The confirmation path below always performs an independent fresh
         // observation before any signer handoff.
         const cycleObservation = this.cyclePositionObservations.get(position.id);
-        this.cyclePositionObservations.delete(position.id);
-        let observation = cycleObservation ?? await this.observeManagementPosition(position, now);
+        // Keep the last cycle observation available for the next management
+        // tick. Telegram renders the persisted projection of this same
+        // observation, so consuming it here would reintroduce a source split
+        // on the following management tick.
+        let observation = cycleObservation ?? await this.clients.telemetry.run('management', () => this.observeManagementPosition(position, now));
         // PnL evidence can be absent from an otherwise valid lightweight
         // snapshot when one canonical price read is transiently unavailable.
         // Retry the complete read twice before evaluating rules; if evidence
         // remains absent, PnL rules still fail closed while range rules run.
         for (let retry = 0; managementPnlPct(position, observation, this.policy, now) === null && retry < 2; retry += 1) {
-          observation = await this.observeManagementPosition(position, now);
+          observation = await this.clients.telemetry.run('management', () => this.observeManagementPosition(position, now));
         }
         const inRange = observation.state.tick >= position.plan.tickLower && observation.state.tick < position.plan.tickUpper;
         position.outOfRangeSince = inRange ? null : position.outOfRangeSince ?? now;
@@ -891,7 +998,7 @@ export class Agent {
           const executed = await this.signer.claim(position); state.positions[index] = executed.value;
           state.transactions.push(...executed.transactions); hashes = executed.transactions.map(transaction => transaction.hash);
         } else if (['close', 'rebalance', 'emergency-close'].includes(decision.action)) {
-          let confirmation = this.carryFreshManagementPrices(await this.observeManagementPosition(position, now), observation, now);
+          let confirmation = this.carryFreshManagementPrices(await this.clients.telemetry.run('confirmation', () => this.observeManagementPosition(position, now)), observation, now);
           let confirmInRange = confirmation.state.tick >= position.plan.tickLower && confirmation.state.tick < position.plan.tickUpper;
           let confirmedDecision = liveManagementDecision(position, confirmation, this.policy, now);
           // Canonical prices can be transiently unavailable from a single
@@ -900,7 +1007,7 @@ export class Agent {
           // silently cancelling a proven SL/TP on one incomplete snapshot.
           const pnlRule = ['STOP_LOSS', 'TAKE_PROFIT', 'TRAILING_TAKE_PROFIT'].includes(decision.reason);
           for (let retry = 0; pnlRule && confirmedDecision.reason.startsWith('PnL unavailable') && retry < 2; retry += 1) {
-            confirmation = this.carryFreshManagementPrices(await this.observeManagementPosition(position, now), observation, now);
+            confirmation = this.carryFreshManagementPrices(await this.clients.telemetry.run('confirmation', () => this.observeManagementPosition(position, now)), observation, now);
             confirmInRange = confirmation.state.tick >= position.plan.tickLower && confirmation.state.tick < position.plan.tickUpper;
             confirmedDecision = liveManagementDecision(position, confirmation, this.policy, now);
           }
@@ -924,17 +1031,26 @@ export class Agent {
           await this.signer.health();
           const closeAttempt: typeof position = { ...position, lastAction: (decision.action === 'emergency-close' ? 'emergency-close' : 'close') as 'emergency-close' | 'close', closeReason: decision.reason, updatedAt: now };
           const executed = await this.signer.close(closeAttempt, confirmation, this.policy, decision.action === 'emergency-close');
+          const finalPnlPct = closeNotificationPnlPct(position, confirmation, this.policy, now, executed.value.realizedPnlUsd, decision.reason);
+          const normalizeAfterClose = shouldAttemptPostCloseNormalization(finalPnlPct);
+          if (!normalizeAfterClose) {
+            executed.value.normalization = { ...executed.value.normalization, status: 'not-required', lastError: null };
+          }
           state.positions[index] = executed.value; state.transactions.push(...executed.transactions); hashes = executed.transactions.map(transaction => transaction.hash);
           recordClosedOutcome(state, observation, position.id, decision.reason, now, this.policy, executed.value.realizedPnlUsd);
           const closeHash = executed.transactions.find(transaction => transaction.action === 'decrease' || transaction.action === 'claim')?.hash;
-          enqueue({ id: `${position.id}:closed:${closeHash ?? Math.floor(now)}`, kind: 'closed', positionId: position.id, protocol: position.plan.pool.protocol, tokenId: position.tokenId.toString(), symbol: positionSymbol(position, confirmation), reason: decision.reason, pnlPct: closeNotificationPnlPct(position, confirmation, this.policy, now, executed.value.realizedPnlUsd, decision.reason), valueUsd: (confirmation as any).valueUsd ?? null, feeUsd: (confirmation as any).feeUsd ?? null, txHash: closeHash, status: 'SUCCESS', at: now });
+          enqueue({ id: `${position.id}:closed:${closeHash ?? Math.floor(now)}`, kind: 'closed', positionId: position.id, protocol: position.plan.pool.protocol, tokenId: position.tokenId.toString(), symbol: positionSymbol(position, confirmation), reason: decision.reason, pnlPct: finalPnlPct, valueUsd: (confirmation as any).valueUsd ?? null, feeUsd: (confirmation as any).feeUsd ?? null, txHash: closeHash, status: 'SUCCESS', at: now });
           const closedMemory = await this.tokenMemory.load(), closedKey = `${position.chainId}:${(position.plan.depositAssets[0]?.token ?? '').toLowerCase()}`, closedEntry = closedMemory[closedKey];
-          if (closedEntry) { closedEntry.closedPositions += 1; closedEntry.lastCloseAt = now; closedEntry.lastCloseReason = decision.reason; const closeBasisUsd = position.entryPrincipalUsd ?? position.plan.depositUsd; const pnl = executed.value.realizedPnlUsd == null || !closeBasisUsd ? null : executed.value.realizedPnlUsd / closeBasisUsd * 100; if (pnl != null) { const n = closedEntry.closedPositions; closedEntry.averagePnlPct = ((closedEntry.averagePnlPct * (n - 1)) + pnl) / n; } if (decision.reason === 'TAKE_PROFIT' || decision.reason === 'TRAILING_TAKE_PROFIT') { closedEntry.wins += 1; closedEntry.consecutiveStopLossCloses = 0; closedEntry.consecutiveOutOfRangeCloses = 0; } else if (decision.reason === 'STOP_LOSS') { closedEntry.losses += 1; closedEntry.consecutiveStopLossCloses += 1; closedEntry.consecutiveOutOfRangeCloses = 0; } else if (decision.reason === 'OUT_OF_RANGE_TIMEOUT') { closedEntry.consecutiveOutOfRangeCloses += 1; closedEntry.consecutiveStopLossCloses = 0; } else if (decision.reason === 'FAR_ABOVE_RANGE') { closedEntry.consecutiveOutOfRangeCloses = 0; closedEntry.consecutiveStopLossCloses = 0; if (pnl != null) pnl >= 0 ? closedEntry.wins += 1 : closedEntry.losses += 1; } await this.tokenMemory.save(closedMemory); }
+          if (closedEntry) { closedEntry.closedPositions += 1; closedEntry.lastCloseAt = now; closedEntry.lastCloseReason = decision.reason; const closeBasisUsd = position.entryPrincipalUsd; const pnl = executed.value.realizedPnlUsd == null || !closeBasisUsd ? null : executed.value.realizedPnlUsd / closeBasisUsd * 100; if (pnl != null) { const n = closedEntry.closedPositions; closedEntry.averagePnlPct = ((closedEntry.averagePnlPct * (n - 1)) + pnl) / n; } if (decision.reason === 'TAKE_PROFIT' || decision.reason === 'TRAILING_TAKE_PROFIT') { closedEntry.wins += 1; closedEntry.consecutiveStopLossCloses = 0; closedEntry.consecutiveOutOfRangeCloses = 0; } else if (decision.reason === 'STOP_LOSS') { closedEntry.losses += 1; closedEntry.consecutiveStopLossCloses += 1; closedEntry.consecutiveOutOfRangeCloses = 0; } else if (decision.reason === 'OUT_OF_RANGE_TIMEOUT') { closedEntry.consecutiveOutOfRangeCloses += 1; closedEntry.consecutiveStopLossCloses = 0; } else if (decision.reason === 'FAR_ABOVE_RANGE') { closedEntry.consecutiveOutOfRangeCloses = 0; closedEntry.consecutiveStopLossCloses = 0; if (pnl != null) pnl >= 0 ? closedEntry.wins += 1 : closedEntry.losses += 1; } await this.tokenMemory.save(closedMemory); }
           // Persist the confirmed close before normalization. If Relay fails
           // or the process restarts, the position remains CLOSED and the
           // pending/failed normalization is retried from observed balances.
           state.transactions = state.transactions.slice(-5000);
           await this.repository.setStrategyState(state);
+          if (!normalizeAfterClose) {
+            results.push({ positionId: position.id, action: 'close', reason: 'NORMALIZATION_NOT_REQUIRED_ZERO_PNL', transactionHashes: hashes });
+            continue;
+          }
           const beforeNormalize = await this.repository.controls();
           if ((beforeNormalize.botState ?? 'STOPPED') !== 'RUNNING') {
             const closed = state.positions[index]!;
@@ -947,17 +1063,13 @@ export class Agent {
             const normalized = await this.signer.normalize(executed.value);
             state.positions[index] = normalized.value; state.transactions.push(...normalized.transactions);
             hashes.push(...normalized.transactions.map(transaction => transaction.hash));
+            const normalizationTx = normalized.transactions.find(transaction => transaction.action === 'swap')?.hash;
+            if (normalizationTx) enqueue({ id: `${position.id}:normalization:${normalized.value.normalization.attempts}`, kind: 'normalization', positionId: position.id, protocol: position.plan.pool.protocol, tokenId: position.tokenId.toString(), symbol: positionSymbol(position, confirmation), targetSymbol: positionTargetSymbol(position, confirmation), status: 'SUCCESS', txHash: normalizationTx, at: now });
           } catch (error) {
             const closed = state.positions[index]!;
             closed.normalization = { ...closed.normalization, status: 'failed', attempts: closed.normalization.attempts + 1, lastError: errorMessage(error) };
             results.push({ positionId: position.id, action: 'normalize', reason: `POST_CLOSE_NORMALIZATION_FAILED: ${errorMessage(error)}`, transactionHashes: [] });
             enqueue({ id: `${position.id}:normalization:${closed.normalization.attempts}`, kind: 'normalization', positionId: position.id, protocol: position.plan.pool.protocol, tokenId: position.tokenId.toString(), symbol: positionSymbol(position, confirmation), targetSymbol: positionTargetSymbol(position, confirmation), status: 'FAILED', error: errorMessage(error), at: now });
-          }
-          if (state.positions[index]?.normalization.status === 'complete') {
-            const normalized = state.positions[index]!;
-            const normalizationTx = hashes.at(-1);
-            const hasSwap = state.transactions.some(transaction => transaction.positionId === position.id && transaction.action === 'swap' && transaction.hash === normalizationTx);
-            if (hasSwap) enqueue({ id: `${position.id}:normalization:${normalized.normalization.attempts}`, kind: 'normalization', positionId: position.id, protocol: position.plan.pool.protocol, tokenId: position.tokenId.toString(), symbol: positionSymbol(position, confirmation), targetSymbol: positionTargetSymbol(position, confirmation), status: 'SUCCESS', txHash: normalizationTx, at: now });
           }
         } else {
           position.updatedAt = now; position.lastAction = decision.action;
@@ -1002,7 +1114,7 @@ export class Agent {
     let closePnlPct: number | null = null;
     let closeSymbol: string | undefined;
     if (current.status === 'open') {
-      const observation = await this.observePoolLightweight(current.pool);
+      const observation = await this.clients.telemetry.run('management', () => this.observePoolLightweight(current.pool));
       const chain = getChain(current.chainId);
       const quoteAddresses = [chain.primaryStable, chain.wrappedNative].filter(Boolean).map(address => address!.toLowerCase());
       const baseToken = [observation.state.token0, observation.state.token1].find(token => !quoteAddresses.includes(token.address.toLowerCase()));

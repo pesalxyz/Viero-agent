@@ -23,7 +23,7 @@ The included chain configuration covers Robinhood Chain (`4663`), BNB Smart Chai
 
 ## Prerequisites
 
-- Node.js 20 or newer (Node.js 22 recommended)
+- Node.js 24.15.0 or newer on the Node.js 24 LTS line
 - npm
 - `gmgn-cli` plus your own GMGN API key for live discovery
 - PostgreSQL 17 if you choose database persistence; file persistence is supported without it

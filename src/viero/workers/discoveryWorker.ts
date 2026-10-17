@@ -6,6 +6,7 @@ import { Gmgn, Market, type DexPair } from '../adapters/providers.js';
 import { Indexer } from '../adapters/indexer.js';
 import { factoryAbi, initializeEvent } from '../adapters/abi.js';
 import { firstBlockAt, pagedLogs } from '../adapters/events.js';
+import { defaultRpcTelemetry } from '../observability/rpcTelemetry.js';
 
 export type DiscoveryResult = { chainId: ChainId; pools: PoolRef[]; tokens: Address[]; pairs: DexPair[]; issues: string[]; coverage: string[] };
 export async function discover(chainId: ChainId, services: { clients: PublicClients; gmgn: Gmgn; market: Market; indexer: Indexer }, options: { tokenLimit: number; seeds?: PoolRef[]; scanFrom?: bigint } = { tokenLimit: 3 }): Promise<DiscoveryResult> {
@@ -54,7 +55,7 @@ export async function discover(chainId: ChainId, services: { clients: PublicClie
   try {
     const block = await client.getBlock({ blockNumber: head });
     const from = options.scanFrom ?? await firstBlockAt(client, head, Number(block.timestamp) - 1800);
-    const logs = await pagedLogs(from, head, (fromBlock, toBlock) => client.getLogs({ address: c.v4.poolManager, event: initializeEvent, strict: true, fromBlock, toBlock }));
+    const logs = await pagedLogs(from, head, (fromBlock, toBlock) => client.getLogs({ address: c.v4.poolManager, event: initializeEvent, strict: true, fromBlock, toBlock }), 1000n, 1000, { chainId, telemetry: defaultRpcTelemetry });
     for (const log of logs) {
       if (log.removed) throw new Error('REORG_DURING_V4_DISCOVERY');
       const k = log.args;

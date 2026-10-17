@@ -7,6 +7,13 @@ const poolKeyParameter = { type: 'tuple', components: [
 ] } as const;
 export const V4_ACTIONS = { INCREASE_LIQUIDITY: 0x00, DECREASE_LIQUIDITY: 0x01, MINT_POSITION: 0x02, SETTLE_PAIR: 0x0d, TAKE_PAIR: 0x11 } as const;
 
+// PositionManager calculates the exact token deltas with its own integer
+// rounding. Give each non-zero maximum one raw unit of headroom so a
+// mathematically exact local delta cannot fail on-chain by one wei.
+export function v4MaximumAmount(amount: bigint): bigint {
+  return amount >= maxUint128 ? maxUint128 : amount > 0n ? amount + 1n : 0n;
+}
+
 function pair(plan: PositionPlan) {
   const first = plan.depositAssets[0], second = plan.depositAssets[1];
   if (!first || !second) throw new Error('POSITION_REQUIRES_TWO_ASSETS');
@@ -25,7 +32,7 @@ export function v4MintData(plan: PositionPlan, recipient: Address): Hex {
   const actions = concatHex([`0x${V4_ACTIONS.MINT_POSITION.toString(16).padStart(2, '0')}`, `0x${V4_ACTIONS.SETTLE_PAIR.toString(16).padStart(2, '0')}`]);
   const params = [
     encodeAbiParameters([poolKeyParameter, { type: 'int24' }, { type: 'int24' }, { type: 'uint256' }, { type: 'uint128' }, { type: 'uint128' }, { type: 'address' }, { type: 'bytes' }],
-      [{ currency0: key.currency0, currency1: key.currency1, fee: key.fee, tickSpacing: key.tickSpacing, hooks: key.hooks }, plan.tickLower, plan.tickUpper, plan.liquidity, a0.amount, a1.amount, recipient, '0x']),
+      [{ currency0: key.currency0, currency1: key.currency1, fee: key.fee, tickSpacing: key.tickSpacing, hooks: key.hooks }, plan.tickLower, plan.tickUpper, plan.liquidity, v4MaximumAmount(a0.amount), v4MaximumAmount(a1.amount), recipient, '0x']),
     encodeAbiParameters([{ type: 'address' }, { type: 'address' }], [key.currency0, key.currency1]),
   ];
   return encodeAbiParameters([{ type: 'bytes' }, { type: 'bytes[]' }], [actions, params]);
