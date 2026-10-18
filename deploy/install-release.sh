@@ -72,7 +72,16 @@ if [[ -f /var/lib/viero-signer/relay-operations.db ]]; then
   node "$source_dir/deploy/check-relay-store.mjs" /var/lib/viero-signer/relay-operations.db
 fi
 if [[ -f /var/lib/viero-signer/transactions.jsonl ]]; then
-  node "$source_dir/deploy/check-legacy-journal.mjs" /var/lib/viero-signer/transactions.jsonl
+  disposition_file=/var/lib/viero-signer/legacy-dispositions.json
+  if [[ ! -f "$disposition_file" ]]; then
+    printf 'Missing required historical disposition for legacy signer journal: %s\n' "$disposition_file" >&2
+    exit 78
+  fi
+  if [[ "$(stat -c '%u' "$disposition_file")" != 0 ]] || find "$disposition_file" -perm /027 -print -quit | grep -q .; then
+    printf 'Historical disposition ownership/mode is unsafe: %s\n' "$disposition_file" >&2
+    exit 78
+  fi
+  node "$source_dir/deploy/check-legacy-journal.mjs" /var/lib/viero-signer/transactions.jsonl "$disposition_file"
 fi
 if [[ ! -f "$source_dir/build/viero/signer-server.js" || ! -f "$source_dir/package-lock.json" ]]; then
   printf 'Built release and package lock are required before installation.\n' >&2
