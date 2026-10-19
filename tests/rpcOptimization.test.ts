@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EvidenceCache } from '../src/viero/storage/evidenceCache.js';
@@ -71,6 +71,22 @@ test('corrupt or missing evidence cache fails closed and concurrent writes remai
     await Promise.all(items.map(item => cache.putToken(item)));
     for (const item of items) assert.equal((await cache.token(item.chainId, item.address, HASH_A, 1n, HASH_A))?.symbol, item.symbol);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('production evidence cache uses the explicit writable state path, never release cwd', async () => {
+  const { dir, file } = await tempCache();
+  const prior = process.env.VIERO_EVIDENCE_CACHE_FILE;
+  try {
+    process.env.VIERO_EVIDENCE_CACHE_FILE = file;
+    const cache = new EvidenceCache();
+    assert.equal(cache.file, file);
+    await cache.putToken({ chainId: 4663, address: '0x0000000000000000000000000000000000000002', bytecodeHash: HASH_A, decimals: 18, symbol: 'PONS', verifiedAtBlock: '1', verifiedAtBlockHash: HASH_A });
+    assert.match(await readFile(file, 'utf8'), /PONS/);
+  } finally {
+    if (prior === undefined) delete process.env.VIERO_EVIDENCE_CACHE_FILE;
+    else process.env.VIERO_EVIDENCE_CACHE_FILE = prior;
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('RPC telemetry is bounded, records workflow/caches, and never changes caller behavior', async () => {
