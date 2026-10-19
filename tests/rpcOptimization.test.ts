@@ -89,6 +89,21 @@ test('production evidence cache uses the explicit writable state path, never rel
   }
 });
 
+test('production evidence cache fails closed when its path is not configured', () => {
+  const priorNode = process.env.NODE_ENV;
+  const priorCache = process.env.VIERO_EVIDENCE_CACHE_FILE;
+  try {
+    process.env.NODE_ENV = 'production';
+    delete process.env.VIERO_EVIDENCE_CACHE_FILE;
+    assert.throws(() => new EvidenceCache(), /VIERO_EVIDENCE_CACHE_FILE_REQUIRED/);
+  } finally {
+    if (priorNode === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = priorNode;
+    if (priorCache === undefined) delete process.env.VIERO_EVIDENCE_CACHE_FILE;
+    else process.env.VIERO_EVIDENCE_CACHE_FILE = priorCache;
+  }
+});
+
 test('RPC telemetry is bounded, records workflow/caches, and never changes caller behavior', async () => {
   const telemetry = new RpcTelemetry('autonomous-test', 64);
   await telemetry.run('candidate-observation', async () => {

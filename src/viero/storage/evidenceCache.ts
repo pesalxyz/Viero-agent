@@ -12,7 +12,12 @@ const empty = (): EvidenceFile => ({ version: 1, tokens: {}, pools: {} });
 export class EvidenceCache {
   private data: EvidenceFile | null = null;
   private lock: Promise<void> = Promise.resolve();
-  constructor(readonly file = process.env.VIERO_EVIDENCE_CACHE_FILE ?? join(process.cwd(), 'data/viero/evidence-cache.json'), readonly telemetry: RpcTelemetry = defaultRpcTelemetry) {}
+  readonly file: string;
+  constructor(file?: string, readonly telemetry: RpcTelemetry = defaultRpcTelemetry) {
+    const configured = file ?? process.env.VIERO_EVIDENCE_CACHE_FILE;
+    if (!configured && process.env.NODE_ENV === 'production') throw new Error('VIERO_EVIDENCE_CACHE_FILE_REQUIRED');
+    this.file = configured ?? join(process.cwd(), 'data/viero/evidence-cache.json');
+  }
 
   async token(chainId: number, address: string, bytecodeHash: string, atBlock: bigint, atBlockHash: string): Promise<CachedTokenMetadata | null> {
     return this.serial(async () => {
