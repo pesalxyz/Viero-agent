@@ -196,6 +196,7 @@ function fallbackReportSummary(facts: ReturnType<typeof reportFacts>): string {
     const handoff = facts.candidateHandoff;
     const status = handoff?.status === 'SKIPPED'
       ? handoff.reason === 'NO_SUPPORTED_POOL' ? '❌ NO_SUPPORTED_POOL' : handoff.reason === 'BOT_STOPPED' ? '⏸ Handoff skipped — BOT_STOPPED' : '⚠️ Candidate handoff unavailable'
+      : handoff?.status === 'FAILED' ? '❌ Candidate execution failed'
       : facts.botState === 'STOPPED' ? '⏸ Handoff skipped — BOT_STOPPED' : 'No candidate execution result';
     candidateLines = ['🎯 Candidate', selected.label, status];
   } else candidateLines = ['🎯 Candidate', 'None'];

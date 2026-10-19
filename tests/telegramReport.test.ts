@@ -361,6 +361,25 @@ test('auto-report sends a fresh successful run exactly once', async () => {
   assert.equal(priv.lastAutomaticReportId, fresh.id);
 });
 
+test('candidate handoff reports failed execution instead of EXECUTED when evidence write fails', async () => {
+  const run = makeRun({
+    selectedTokenAddress: '0x' + '1'.repeat(40) as `0x${string}`,
+    selectedTokenSymbol: 'PONS',
+    candidateHandoff: {
+      selectedTokenAddress: '0x' + '1'.repeat(40) as `0x${string}`,
+      selectedTokenSymbol: 'PONS', status: 'FAILED', reason: 'EXECUTION_FAILED',
+      controlsBotState: 'RUNNING', initialBotState: 'RUNNING', preExecutionBotState: 'RUNNING', timestamp: 1700000030,
+    },
+    errors: [{ chainId: 4663, error: "ENOENT: no such file or directory, mkdir '/opt/viero/releases/data'", code: 'ENOENT' }],
+    status: 'failed',
+  });
+  const repo = new FakeRepo(run);
+  const { bot } = makeBot(repo as never, makeFakeLlm(''));
+  const summary = await (bot as unknown as BotPrivate).summarizeReport(run);
+  assert.match(summary, /Candidate execution failed/);
+  assert.doesNotMatch(summary, /No candidate execution result/);
+});
+
 test('auto-report does not re-send the same run twice', async () => {
   const sentinel = makeRun({ status: 'ok', observations: [observationStub(8453)] });
   const fresh = makeRun({

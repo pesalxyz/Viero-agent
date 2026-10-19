@@ -355,8 +355,19 @@ export class Agent {
       const memoryKey = `${selected.chainId}:${selected.tokenAddress.toLowerCase()}`;
       const memoryEntry = tokenMemory[memoryKey];
       if (memoryEntry) { memoryEntry.candidateAttempts += 1; memoryEntry.lastAttemptAt = Date.now() / 1000; memoryEntry.lastAttemptResult = 'HANDED_OFF'; memoryEntry.lastPoolId = selected.poolId; await this.tokenMemory.save(tokenMemory); }
-      if (run.candidateHandoff) run.candidateHandoff.status = 'EXECUTED';
       await this.executeCandidateToken({ chainId: selected.chainId, tokenAddress: selected.tokenAddress, mode: options.mode as Extract<Mode, 'live-execution' | 'live-readonly'>, run, dexShortlist: selectedDexShortlist, boundaries });
+      // A handoff is EXECUTED only after executeCandidateToken has recorded
+      // successful execution evidence.  Pre-execution failures (including
+      // evidence-cache ENOENT) must remain visible as failed/degraded runs.
+      if (run.candidateHandoff && run.errors.length > 0) {
+        run.candidateHandoff.status = 'FAILED';
+        run.candidateHandoff.reason = 'EXECUTION_FAILED';
+      } else if (run.candidateHandoff && options.mode === 'live-execution' && run.decisions.some(decision => decision.opened)) {
+        run.candidateHandoff.status = 'EXECUTED';
+      } else if (run.candidateHandoff && options.mode === 'live-execution') {
+        run.candidateHandoff.status = 'FAILED';
+        run.candidateHandoff.reason = 'EXECUTION_FAILED';
+      }
     } else if (passCount > 0) { if (run.candidateHandoff && run.candidateHandoff.status !== 'SKIPPED') { run.candidateHandoff.status = 'SKIPPED'; run.candidateHandoff.reason = preExecutionControls.botState !== 'RUNNING' ? 'BOT_STOPPED' : null; } console.error(`[viero.candidate-selection] pass=${passCount} eligible=${eligibleCount} selected=none selected_address=none`); }
     run.finishedAt = options.mode === 'replay' ? now : Date.now() / 1000;
     // Some lightweight discovery/test repositories do not expose strategyState;
