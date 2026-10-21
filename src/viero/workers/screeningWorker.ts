@@ -492,7 +492,8 @@ export class Agent {
         this.checkedDeployments.add(chainId);
       }
       // Search both protocols completely before choosing by external USD TVL.
-      const search = await this.clients.telemetry.run('candidate-discovery', () => searchVerifiedPoolsForToken(this.clients.get(chainId), chainId, tokenAddress, { dex: input.dexShortlist }));
+      const telemetryContext = { cycleId: run.id, candidateToken: tokenAddress };
+      const search = await this.clients.telemetry.run('candidate-discovery', () => searchVerifiedPoolsForToken(this.clients.get(chainId), chainId, tokenAddress, { dex: input.dexShortlist, telemetryContext }), telemetryContext);
       run.poolDiscovery = search.evidence;
       const shortlist = search.pools;
       console.error(`[viero.pool-discovery] graphql_v4=${search.evidence.graphqlV4Hints.length} dex_v4=${search.evidence.dexV4Hints.length} dex_v3=${search.evidence.dexV3Hints.length} gecko_v3=${search.evidence.geckoV3Hints.length} verified=${shortlist.length} selected=${search.evidence.selectedPool ?? 'none'}`);
@@ -509,7 +510,8 @@ export class Agent {
 
       // Step 2: on-chain verifyPool (RPC).
       const head = await this.clients.get(chainId).getBlockNumber({ cacheTime: 0 });
-      const state = await this.clients.telemetry.run('candidate-verify', () => verifyPool(this.clients.get(chainId), poolRef, head));
+      const verifiedPoolIdentity = poolRef.protocol === 'v4' ? poolRef.poolId : poolRef.poolAddress;
+      const state = await this.clients.telemetry.run('selected-pool-fresh-verification', () => verifyPool(this.clients.get(chainId), poolRef, head), { ...telemetryContext, poolIdentity: verifiedPoolIdentity });
 
       // Step 3: GMGN prices for both pool tokens.
       const prices = (await Promise.all([state.token0, state.token1].map(t => this.market.prices(chainId, t.address)))).flat();
@@ -522,7 +524,7 @@ export class Agent {
       const chain = getChain(chainId);
       const nativeUsd = chain.native.isErc20Backed ? 1 : chain.wrappedNative
         ? (await this.market.prices(chainId, chain.wrappedNative))[0]?.usd ?? null : null;
-      const observation = await this.clients.telemetry.run('candidate-observation', () => targetedRpcObservation(this.clients.get(chainId), state, prices, this.policy.windowMinutes, nativeUsd, undefined, input.boundaries));
+      const observation = await this.clients.telemetry.run('selected-pool-historical-observation', () => targetedRpcObservation(this.clients.get(chainId), state, prices, this.policy.windowMinutes, nativeUsd, undefined, input.boundaries), { ...telemetryContext, poolIdentity: verifiedPoolIdentity });
       for (const risk of risks) if (!observation.risks.some((existing) => existing.token === risk.token)) observation.risks.push(risk);
       const finalNow = Date.now() / 1000;
       const candidate = screen(observation, this.policy, finalNow, { tokenVolume1h: run.selectedTokenVolume1h }); // token-level GMGN volume is authoritative
@@ -988,13 +990,13 @@ export class Agent {
         // tick. Telegram renders the persisted projection of this same
         // observation, so consuming it here would reintroduce a source split
         // on the following management tick.
-        let observation = cycleObservation ?? await this.clients.telemetry.run('management', () => this.observeManagementPosition(position, now));
+        let observation = cycleObservation ?? await this.clients.telemetry.run('position-management', () => this.observeManagementPosition(position, now));
         // PnL evidence can be absent from an otherwise valid lightweight
         // snapshot when one canonical price read is transiently unavailable.
         // Retry the complete read twice before evaluating rules; if evidence
         // remains absent, PnL rules still fail closed while range rules run.
         for (let retry = 0; managementPnlPct(position, observation, this.policy, now) === null && retry < 2; retry += 1) {
-          observation = await this.clients.telemetry.run('management', () => this.observeManagementPosition(position, now));
+          observation = await this.clients.telemetry.run('position-management', () => this.observeManagementPosition(position, now));
         }
         const inRange = observation.state.tick >= position.plan.tickLower && observation.state.tick < position.plan.tickUpper;
         position.outOfRangeSince = inRange ? null : position.outOfRangeSince ?? now;
@@ -1009,7 +1011,7 @@ export class Agent {
           const executed = await this.signer.claim(position); state.positions[index] = executed.value;
           state.transactions.push(...executed.transactions); hashes = executed.transactions.map(transaction => transaction.hash);
         } else if (['close', 'rebalance', 'emergency-close'].includes(decision.action)) {
-          let confirmation = this.carryFreshManagementPrices(await this.clients.telemetry.run('confirmation', () => this.observeManagementPosition(position, now)), observation, now);
+          let confirmation = this.carryFreshManagementPrices(await this.clients.telemetry.run('position-management', () => this.observeManagementPosition(position, now)), observation, now);
           let confirmInRange = confirmation.state.tick >= position.plan.tickLower && confirmation.state.tick < position.plan.tickUpper;
           let confirmedDecision = liveManagementDecision(position, confirmation, this.policy, now);
           // Canonical prices can be transiently unavailable from a single
@@ -1018,7 +1020,7 @@ export class Agent {
           // silently cancelling a proven SL/TP on one incomplete snapshot.
           const pnlRule = ['STOP_LOSS', 'TAKE_PROFIT', 'TRAILING_TAKE_PROFIT'].includes(decision.reason);
           for (let retry = 0; pnlRule && confirmedDecision.reason.startsWith('PnL unavailable') && retry < 2; retry += 1) {
-            confirmation = this.carryFreshManagementPrices(await this.clients.telemetry.run('confirmation', () => this.observeManagementPosition(position, now)), observation, now);
+            confirmation = this.carryFreshManagementPrices(await this.clients.telemetry.run('position-management', () => this.observeManagementPosition(position, now)), observation, now);
             confirmInRange = confirmation.state.tick >= position.plan.tickLower && confirmation.state.tick < position.plan.tickUpper;
             confirmedDecision = liveManagementDecision(position, confirmation, this.policy, now);
           }
@@ -1125,7 +1127,7 @@ export class Agent {
     let closePnlPct: number | null = null;
     let closeSymbol: string | undefined;
     if (current.status === 'open') {
-      const observation = await this.clients.telemetry.run('management', () => this.observePoolLightweight(current.pool));
+      const observation = await this.clients.telemetry.run('position-management', () => this.observePoolLightweight(current.pool));
       const chain = getChain(current.chainId);
       const quoteAddresses = [chain.primaryStable, chain.wrappedNative].filter(Boolean).map(address => address!.toLowerCase());
       const baseToken = [observation.state.token0, observation.state.token1].find(token => !quoteAddresses.includes(token.address.toLowerCase()));

@@ -19,7 +19,7 @@ import { factoryAbi, initializeEvent, v4PositionManagerPoolKeyAbi } from '../ada
 import { addressSchema, poolId, type PoolRef } from '../domain.js';
 import { pagedLogs } from '../adapters/events.js';
 import { verifyPool } from './pools.js';
-import { defaultRpcTelemetry } from '../observability/rpcTelemetry.js';
+import { defaultRpcTelemetry, type RpcScopeContext } from '../observability/rpcTelemetry.js';
 
 export type TargetedPool = {
   chainId: ChainId;
@@ -196,7 +196,7 @@ const SPACING_CANDIDATES = [1, 10, 50, 60, 100, 200, 250, 300, 400, 500, 600, 64
 export type PoolKeyRecovery = { poolId: string; method: TargetedPool['recoveryMethod'] | null; failureReason?: string };
 
 /** Trust only a full on-chain key, or a zero-hook tuple that hashes exactly to the hint. */
-export async function recoverExternalV4PoolHints(client: PublicClient, chainId: ChainId, token: Address, hints: ExternalPoolHint[], onRecovery?: (result: PoolKeyRecovery) => void, onInitializeScan?: () => void): Promise<TargetedPool[]> {
+export async function recoverExternalV4PoolHints(client: PublicClient, chainId: ChainId, token: Address, hints: ExternalPoolHint[], onRecovery?: (result: PoolKeyRecovery) => void, onInitializeScan?: () => void, telemetryContext: Omit<RpcScopeContext, 'workflow'> = {}): Promise<TargetedPool[]> {
   const result: TargetedPool[] = [];
   const unresolved: ExternalPoolHint[] = [];
   for (const h of hints.filter(h => h.token0.toLowerCase() === token.toLowerCase() || h.token1.toLowerCase() === token.toLowerCase())) {
@@ -238,7 +238,7 @@ export async function recoverExternalV4PoolHints(client: PublicClient, chainId: 
     let initialized: TargetedPool[] = [];
     let initializeError: string | null = null;
     try {
-      initialized = await discoverV4PoolsForToken(client, chainId, token, { quoteTokens });
+      initialized = await defaultRpcTelemetry.run('v4-initialize-fallback', () => discoverV4PoolsForToken(client, chainId, token, { quoteTokens }), telemetryContext);
     } catch (error) {
       initializeError = `INITIALIZE_RPC_FAILURE:${error instanceof Error ? error.message : String(error)}`;
       initialized = [];
@@ -309,14 +309,14 @@ export function mergeExternalPoolHints(...sources: ExternalPoolHint[][]): Extern
 /** Finish both protocol searches before choosing a pool. Provider data is advisory. */
 export async function searchVerifiedPoolsForToken(
   client: PublicClient, chainId: ChainId, token: Address,
-  options: { dex?: ExternalPoolShortlist; verify?: typeof verifyPool; head?: bigint } = {},
+  options: { dex?: ExternalPoolShortlist; verify?: typeof verifyPool; head?: bigint; telemetryContext?: Omit<RpcScopeContext, 'workflow'> } = {},
 ): Promise<{ pools: VerifiedTargetedPool[]; evidence: PoolDiscoveryEvidence }> {
   const evidence: PoolDiscoveryEvidence = { graphqlV4Hints: [], dexV4Hints: [], dexV3Hints: [], geckoV3FallbackUsed: false, geckoV3Hints: [], recovery: [], verification: [], fallbackUsed: false, providerErrors: [], advisoryIssues: [], providerDisagreements: [], ranked: [] };
   const verify = options.verify ?? verifyPool;
-  const [graphqlResult, dexResult] = await Promise.allSettled([
+  const [graphqlResult, dexResult] = await defaultRpcTelemetry.run('pool-hint-fetch', () => Promise.allSettled([
     fetchUniswapV4Hints(chainId, token),
     options.dex ? Promise.resolve(options.dex) : dexScreenerShortlist(chainId, token),
-  ]);
+  ]), options.telemetryContext);
   const graphql = graphqlResult.status === 'fulfilled' ? graphqlResult.value : [];
   const dex = dexResult.status === 'fulfilled' ? dexResult.value : null;
   if (graphqlResult.status === 'rejected') evidence.providerErrors.push(`GRAPHQL:${String(graphqlResult.reason).slice(0, 120)}`);
@@ -328,7 +328,7 @@ export async function searchVerifiedPoolsForToken(
   let gecko: ExternalPoolHint[] = [];
   if (chainId === 4663 && evidence.dexV3Hints.length === 0) {
     evidence.geckoV3FallbackUsed = true;
-    try { gecko = await fetchGeckoV3Hints(chainId, token); }
+    try { gecko = await defaultRpcTelemetry.run('pool-hint-fetch', () => fetchGeckoV3Hints(chainId, token), options.telemetryContext); }
     catch (error) { evidence.providerErrors.push(`GECKO:${String(error).slice(0, 120)}`); }
     evidence.geckoV3Hints = gecko.map(h => ({ poolAddress: h.identity, liquidityUsd: h.liquidityUsd ?? null }));
   }
@@ -344,7 +344,7 @@ export async function searchVerifiedPoolsForToken(
   }
   const hints = mergeExternalPoolHints(graphql, dexHints, gecko);
   let initializeAlreadySearched = false;
-  const mapped = await recoverExternalV4PoolHints(client, chainId, token, hints, r => evidence.recovery.push(r), () => { initializeAlreadySearched = true; });
+  const mapped = await defaultRpcTelemetry.run('v4-pool-key-recovery', () => recoverExternalV4PoolHints(client, chainId, token, hints, r => evidence.recovery.push(r), () => { initializeAlreadySearched = true; }, options.telemetryContext), options.telemetryContext);
   if (initializeAlreadySearched) { evidence.fallbackUsed = true; evidence.fallbackReason = 'V4_IDENTITY_RECOVERY'; }
   for (const recovery of evidence.recovery) if (recovery.failureReason?.startsWith('INITIALIZE_RPC_FAILURE')) evidence.providerErrors.push(recovery.failureReason);
   const verified: VerifiedTargetedPool[] = [], seen = new Set<string>();
@@ -353,13 +353,20 @@ export async function searchVerifiedPoolsForToken(
     const identity = (pool.poolId ?? pool.poolAddress ?? '').toLowerCase(), key = `${pool.protocol}:${identity}`;
     if (seen.has(key)) return;
     seen.add(key);
+    const verificationContext = { workflow: 'multi-pool-verification' as const, ...options.telemetryContext, poolIdentity: identity };
     try {
-      const ref = targetedPoolToRef(pool), state = await verify(client, ref, head);
+      const ref = targetedPoolToRef(pool), state = await defaultRpcTelemetry.scope(verificationContext, () => verify(client, ref, head));
       if (!state.verified || state.liquidity <= 0n) throw new Error('POOL_NOT_LIVE');
       if (state.token0.address.toLowerCase() !== pool.token0.toLowerCase() || state.token1.address.toLowerCase() !== pool.token1.toLowerCase()) throw new Error('TOKEN_PAIR_MISMATCH');
       verified.push({ pool, ref, liquidity: state.liquidity });
+      defaultRpcTelemetry.verificationOutcome(verificationContext, 'success');
       evidence.verification.push({ identity, protocol: pool.protocol, source: pool.source ?? 'RPC_FALLBACK', verified: true, activeLiquidity: state.liquidity.toString(), tick: state.tick, sqrtPriceX96: state.sqrtPriceX96.toString() });
-    } catch (error) { evidence.verification.push({ identity, protocol: pool.protocol, source: pool.source ?? 'RPC_FALLBACK', verified: false, reason: error instanceof Error ? error.message : 'VERIFICATION_FAILED' }); }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : 'VERIFICATION_FAILED';
+      const outcome = /MISMATCH|POOL_ID|TOKEN_PAIR|FACTORY/.test(reason) ? 'identity-mismatch' : /LIQUIDITY|EMPTY|UNINITIALIZED/.test(reason) ? 'insufficient-liquidity' : /RPC|HTTP|timeout|request/i.test(reason) ? 'rpc-error' : 'other';
+      defaultRpcTelemetry.verificationOutcome(verificationContext, outcome);
+      evidence.verification.push({ identity, protocol: pool.protocol, source: pool.source ?? 'RPC_FALLBACK', verified: false, reason });
+    }
   };
   await Promise.all(mapped.map(check));
 
@@ -367,18 +374,25 @@ export async function searchVerifiedPoolsForToken(
   // A verified V3 pool never suppresses this search or unresolved V4 recovery.
   if (!verified.some(p => p.pool.protocol === 'v4') && !initializeAlreadySearched) {
     evidence.fallbackUsed = true; evidence.fallbackReason = hints.some(h => h.protocol === 'v4') ? 'NO_VERIFIED_EXTERNAL_V4' : 'NO_EXTERNAL_V4_HINT';
-    try { for (const pool of await discoverV4PoolsForToken(client, chainId, token)) await check({ ...pool, source: 'RPC_FALLBACK', recoveryMethod: 'INITIALIZE_LOG' }); }
+    try { for (const pool of await defaultRpcTelemetry.run('v4-initialize-fallback', () => discoverV4PoolsForToken(client, chainId, token), options.telemetryContext)) await check({ ...pool, source: 'RPC_FALLBACK', recoveryMethod: 'INITIALIZE_LOG' }); }
     catch (error) { evidence.providerErrors.push(`V4_RPC_FAILURE:${error instanceof Error ? error.message : String(error)}`); }
   }
   if (!verified.some(p => p.pool.protocol === 'v3')) {
     evidence.fallbackUsed = true; evidence.fallbackReason ??= hints.some(h => h.protocol === 'v3') ? 'NO_VERIFIED_EXTERNAL_V3' : 'NO_EXTERNAL_V3_HINT';
-    try { for (const pool of await discoverV3PoolsForToken(client, chainId, token)) await check({ ...pool, source: 'RPC_FALLBACK' }); }
+    try { for (const pool of await defaultRpcTelemetry.run('v3-factory-fallback', () => discoverV3PoolsForToken(client, chainId, token), options.telemetryContext)) await check({ ...pool, source: 'RPC_FALLBACK' }); }
     catch (error) { evidence.providerErrors.push(`V3_RPC_FAILURE:${error instanceof Error ? error.message : String(error)}`); }
   }
   const ranked = rankVerifiedTargetedPools(verified, 10);
   evidence.ranked = ranked.map(p => ({ identity: p.pool.poolId ?? p.pool.poolAddress ?? '', protocol: p.pool.protocol, source: p.pool.source ?? 'RPC_FALLBACK', liquidityUsd: p.pool.liquidityUsd ?? null, activeLiquidity: p.liquidity.toString(), recoveryMethod: p.pool.recoveryMethod }));
   evidence.selectedPool = evidence.ranked[0]?.identity;
   evidence.finalOutcome = ranked.length ? 'VERIFIED_POOLS' : evidence.providerErrors.length ? 'PROVIDER_FAILURE' : 'NO_SUPPORTED_POOL';
+  if (options.telemetryContext?.cycleId) defaultRpcTelemetry.candidateSummary({
+    cycleId: options.telemetryContext.cycleId, chainId, candidateToken: token,
+    externalHints: hints.length, mappedPools: mapped.length, v4RecoveryAttempts: evidence.recovery.length,
+    verifiedPools: verified.length, failedPools: evidence.verification.filter(item => !item.verified).length,
+    fallbackDiscoveredPools: evidence.verification.filter(item => item.source === 'RPC_FALLBACK').length,
+    selectedPool: evidence.selectedPool ?? null, verificationOutcomes: {},
+  });
   return { pools: ranked, evidence };
 }
 

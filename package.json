@@ -23,6 +23,7 @@
     "agent:preflight": "node build/viero/cli.js preflight",
     "agent:prod": "node build/viero/cli.js watch",
     "operation:recovery": "tsx src/viero/storage/recoveryCli.ts",
+    "viero:rpc-report": "node scripts/viero-rpc-report.mjs",
     "release:viero": "bash deploy/package-release.sh",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",

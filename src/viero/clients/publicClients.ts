@@ -1,7 +1,7 @@
 import { createPublicClient, defineChain, fallback, http, type PublicClient, type Address, type Transport } from 'viem';
 import { getChain } from '../config/chains.js';
 import { type ChainId, errorMessage } from '../domain.js';
-import { RpcTelemetry, defaultRpcTelemetry } from '../observability/rpcTelemetry.js';
+import { RpcTelemetry, defaultRpcTelemetry, type RpcScopeContext } from '../observability/rpcTelemetry.js';
 
 export class PublicClients {
   private clients = new Map<string, PublicClient>();
@@ -22,20 +22,42 @@ export class PublicClients {
 }
 
 function instrumentedHttp(url: string, chainId: ChainId, index: number, telemetry: RpcTelemetry): Transport {
-  const started: number[] = [];
+  const pending: Array<{ methods: string[]; context: RpcScopeContext; startedAt: number }> = [];
+  const requestContexts: RpcScopeContext[] = [];
   const base = http(url, {
     timeout: 20000, retryCount: 2, retryDelay: 750, batch: true,
-    onFetchRequest: () => { started.push(Date.now()); telemetry.physical(chainId, telemetry.workflow(), true, 0); if (index > 0) telemetry.retry(chainId); },
-    onFetchResponse: response => { const at = started.shift(); telemetry.physicalResult(chainId, telemetry.workflow(), response.ok, at == null ? 0 : Date.now() - at); },
+    onFetchRequest: (_request, init) => {
+      const methods = rpcMethods(init.body);
+      // viem's fetch callbacks run outside the caller's AsyncLocalStorage scope.
+      // Pair the envelope with the contexts captured at request() time instead.
+      const context = requestContexts.shift() ?? telemetry.context();
+      pending.push({ methods, context, startedAt: Date.now() });
+      telemetry.physicalEnvelope(chainId, methods, index);
+      if (index > 0) telemetry.retry(chainId, methods[0] ?? 'unknown', context.workflow);
+    },
+    onFetchResponse: response => {
+      const attempt = pending.shift();
+      if (attempt) telemetry.physicalEnvelopeResult(chainId, attempt.methods, response.ok, Date.now() - attempt.startedAt, attempt.context);
+    },
   });
   return ({ chain }) => {
     const transport = base({ chain });
     return { ...transport, request: async (args: Parameters<typeof transport.request>[0]) => {
+      const requestContext = telemetry.context();
+      requestContexts.push(requestContext);
       telemetry.logical(chainId, args.method);
       try { return await transport.request(args); }
       catch (error) { telemetry.physicalResult(chainId, telemetry.workflow(), false, 0, args.method); throw error; }
     } } as ReturnType<typeof base>;
   };
+}
+
+function rpcMethods(body: unknown): string[] {
+  try {
+    const parsed = typeof body === 'string' ? JSON.parse(body) : body;
+    const requests = Array.isArray(parsed) ? parsed : [parsed];
+    return requests.map(request => typeof request?.method === 'string' ? request.method : 'unknown');
+  } catch { return ['unknown']; }
 }
 export async function assertChain(client: PublicClient, id: ChainId) {
   if (await client.getChainId() !== id) throw new Error(`RPC_CHAIN_MISMATCH: expected ${id}`);

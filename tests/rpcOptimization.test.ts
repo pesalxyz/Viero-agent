@@ -1,14 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createServer } from 'node:http';
 import { EvidenceCache } from '../src/viero/storage/evidenceCache.js';
 import { RpcTelemetry } from '../src/viero/observability/rpcTelemetry.js';
 import { exactPoolCreatedEvidence } from '../src/viero/adapters/events.js';
 import { BlockBoundaryCache, firstBlockAt, ObservationRpcMemo, pagedLogs } from '../src/viero/adapters/events.js';
 import { dexScreenerShortlist } from '../src/viero/adapters/targetedPoolDiscovery.js';
 import { demoObservations } from '../src/viero/fixtures/demo.js';
+import { PublicClients } from '../src/viero/clients/publicClients.js';
 
 const HASH_A = `0x${'aa'.repeat(32)}`;
 const HASH_B = `0x${'bb'.repeat(32)}`;
@@ -81,6 +83,7 @@ test('production evidence cache uses the explicit writable state path, never rel
     const cache = new EvidenceCache();
     assert.equal(cache.file, file);
     await cache.putToken({ chainId: 4663, address: '0x0000000000000000000000000000000000000002', bytecodeHash: HASH_A, decimals: 18, symbol: 'PONS', verifiedAtBlock: '1', verifiedAtBlockHash: HASH_A });
+    const { readFile } = await import('node:fs/promises');
     assert.match(await readFile(file, 'utf8'), /PONS/);
   } finally {
     if (prior === undefined) delete process.env.VIERO_EVIDENCE_CACHE_FILE;
@@ -121,6 +124,65 @@ test('RPC telemetry is bounded, records workflow/caches, and never changes calle
   assert.equal(snapshot.observations.openPositionsLast, 2);
   assert.deepEqual(snapshot.operations[0], { role: 'autonomous-test', workflow: 'candidate-observation', chainId: 4663, method: 'eth_call', logical: 1, physical: 1, retries: 1, fallbackAttempts: 1, latencyMs: 16, errors: 1 });
   assert.equal(snapshot.cache.tokenHits, 1);
+});
+
+test('concurrent per-pool scopes remain isolated for 28 verification attempts', async () => {
+  const telemetry = new RpcTelemetry('agent-test');
+  await Promise.all(Array.from({ length: 28 }, (_, i) => telemetry.scope({ workflow: 'multi-pool-verification', cycleId: 'cycle-28', candidateToken: '0x' + '11'.repeat(20), poolIdentity: `pool-${i}` }, async () => {
+    await new Promise(resolve => setTimeout(resolve, i % 3));
+    telemetry.logical(4663, 'eth_call'); telemetry.physical(4663, undefined, true, 1, 'eth_call');
+  })));
+  const rows = telemetry.snapshot().scopes.filter(row => row.workflow === 'multi-pool-verification');
+  assert.equal(rows.length, 28);
+  assert.equal(new Set(rows.map(row => row.poolIdentity)).size, 28);
+  assert.ok(rows.every(row => row.logical === 1 && row.physical === 1 && row.cycleId === 'cycle-28'));
+});
+
+test('physical HTTP envelopes distinguish batches without changing RPC results', async () => {
+  const telemetry = new RpcTelemetry('agent-test');
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    const body = JSON.parse(Buffer.concat(chunks).toString()) as Array<{ id: number; method: string }> | { id: number; method: string };
+    const items = Array.isArray(body) ? body : [body];
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify(items.map(item => ({ jsonrpc: '2.0', id: item.id, result: item.method === 'eth_blockNumber' ? '0x2' : '0x1' }))));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const clients = new PublicClients({ VIERO_RPC_4663: `http://127.0.0.1:${address.port}` }, telemetry);
+    await telemetry.run('selected-pool-fresh-verification', async () => {
+      const client = clients.get(4663);
+      await Promise.all([client.getBlockNumber(), client.getGasPrice()]);
+    }, { cycleId: 'batch-cycle', candidateToken: '0x' + '22'.repeat(20), poolIdentity: 'pool-batch' });
+    const snapshot = telemetry.snapshot();
+    assert.ok(snapshot.transport.httpAttempts >= 1);
+    assert.ok(snapshot.transport.methodAttempts >= 2);
+    assert.ok(snapshot.operations.some(row => row.method === 'eth_blockNumber' && row.logical === 1));
+    assert.ok(snapshot.operations.some(row => row.method === 'eth_gasPrice' && row.logical === 1));
+    assert.ok(snapshot.scopes.some(row => row.poolIdentity === 'pool-batch' && row.method === 'eth_blockNumber'));
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+});
+
+test('telemetry persists bounded daily aggregates and redacts payloads', async () => {
+  const { dir, file } = await tempCache();
+  try {
+    const telemetry = new RpcTelemetry('agent-test', 64, { file, flushMs: 100 });
+    await telemetry.run('v4-pool-key-recovery', async () => { telemetry.logical(4663, 'eth_call'); telemetry.physical(4663, undefined, true, 2, 'eth_call'); }, { cycleId: 'persist-cycle', candidateToken: '0x' + '33'.repeat(20), poolIdentity: 'pool-persist' });
+    await telemetry.flush();
+    const persisted = await RpcTelemetry.readPersisted(file);
+    assert.ok(persisted);
+    const today = new Date().toISOString().slice(0, 10);
+    assert.equal(persisted?.days[today]?.scopes[0]?.poolIdentity, 'pool-persist');
+    const raw = JSON.stringify(persisted);
+    assert.doesNotMatch(raw, /Authorization|api[_-]?key|private[_-]?key|0x[0-9a-f]{64}/i);
+    const reopened = new RpcTelemetry('agent-test', 64, { file });
+    await reopened.ready();
+    assert.equal(reopened.snapshot().persistence?.restored, true);
+    assert.equal(reopened.snapshot().scopes[0]?.physical, 1);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test('cycle block-boundary cache hits only for the same pinned head identity and window', async () => {
