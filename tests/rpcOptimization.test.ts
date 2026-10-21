@@ -75,6 +75,38 @@ test('corrupt or missing evidence cache fails closed and concurrent writes remai
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+test('production evidence cache uses the explicit writable state path, never release cwd', async () => {
+  const { dir, file } = await tempCache();
+  const prior = process.env.VIERO_EVIDENCE_CACHE_FILE;
+  try {
+    process.env.VIERO_EVIDENCE_CACHE_FILE = file;
+    const cache = new EvidenceCache();
+    assert.equal(cache.file, file);
+    await cache.putToken({ chainId: 4663, address: '0x0000000000000000000000000000000000000002', bytecodeHash: HASH_A, decimals: 18, symbol: 'PONS', verifiedAtBlock: '1', verifiedAtBlockHash: HASH_A });
+    const { readFile } = await import('node:fs/promises');
+    assert.match(await readFile(file, 'utf8'), /PONS/);
+  } finally {
+    if (prior === undefined) delete process.env.VIERO_EVIDENCE_CACHE_FILE;
+    else process.env.VIERO_EVIDENCE_CACHE_FILE = prior;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('production evidence cache fails closed when its path is not configured', () => {
+  const priorNode = process.env.NODE_ENV;
+  const priorCache = process.env.VIERO_EVIDENCE_CACHE_FILE;
+  try {
+    process.env.NODE_ENV = 'production';
+    delete process.env.VIERO_EVIDENCE_CACHE_FILE;
+    assert.throws(() => new EvidenceCache(), /VIERO_EVIDENCE_CACHE_FILE_REQUIRED/);
+  } finally {
+    if (priorNode === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = priorNode;
+    if (priorCache === undefined) delete process.env.VIERO_EVIDENCE_CACHE_FILE;
+    else process.env.VIERO_EVIDENCE_CACHE_FILE = priorCache;
+  }
+});
+
 test('RPC telemetry is bounded, records workflow/caches, and never changes caller behavior', async () => {
   const telemetry = new RpcTelemetry('autonomous-test', 64);
   await telemetry.run('candidate-observation', async () => {
