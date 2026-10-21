@@ -15,6 +15,8 @@ release="$staging/viero-release"
 
 mkdir -p "$release"
 cp -R build config deploy docs "$release/"
+mkdir -p "$release/scripts"
+cp scripts/viero-rpc-report.mjs "$release/scripts/"
 cp package.json package-lock.json README.md LICENSE "$release/"
 find "$release/deploy" -type f -name '*.sh' -exec chmod 0755 {} +
 mkdir -p "$root_dir/dist"
