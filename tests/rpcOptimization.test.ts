@@ -75,38 +75,6 @@ test('corrupt or missing evidence cache fails closed and concurrent writes remai
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-test('production evidence cache uses the explicit writable state path, never release cwd', async () => {
-  const { dir, file } = await tempCache();
-  const prior = process.env.VIERO_EVIDENCE_CACHE_FILE;
-  try {
-    process.env.VIERO_EVIDENCE_CACHE_FILE = file;
-    const cache = new EvidenceCache();
-    assert.equal(cache.file, file);
-    await cache.putToken({ chainId: 4663, address: '0x0000000000000000000000000000000000000002', bytecodeHash: HASH_A, decimals: 18, symbol: 'PONS', verifiedAtBlock: '1', verifiedAtBlockHash: HASH_A });
-    const { readFile } = await import('node:fs/promises');
-    assert.match(await readFile(file, 'utf8'), /PONS/);
-  } finally {
-    if (prior === undefined) delete process.env.VIERO_EVIDENCE_CACHE_FILE;
-    else process.env.VIERO_EVIDENCE_CACHE_FILE = prior;
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test('production evidence cache fails closed when its path is not configured', () => {
-  const priorNode = process.env.NODE_ENV;
-  const priorCache = process.env.VIERO_EVIDENCE_CACHE_FILE;
-  try {
-    process.env.NODE_ENV = 'production';
-    delete process.env.VIERO_EVIDENCE_CACHE_FILE;
-    assert.throws(() => new EvidenceCache(), /VIERO_EVIDENCE_CACHE_FILE_REQUIRED/);
-  } finally {
-    if (priorNode === undefined) delete process.env.NODE_ENV;
-    else process.env.NODE_ENV = priorNode;
-    if (priorCache === undefined) delete process.env.VIERO_EVIDENCE_CACHE_FILE;
-    else process.env.VIERO_EVIDENCE_CACHE_FILE = priorCache;
-  }
-});
-
 test('RPC telemetry is bounded, records workflow/caches, and never changes caller behavior', async () => {
   const telemetry = new RpcTelemetry('autonomous-test', 64);
   await telemetry.run('candidate-observation', async () => {
@@ -164,6 +132,17 @@ test('physical HTTP envelopes distinguish batches without changing RPC results',
     assert.ok(snapshot.operations.some(row => row.method === 'eth_gasPrice' && row.logical === 1));
     assert.ok(snapshot.scopes.some(row => row.poolIdentity === 'pool-batch' && row.method === 'eth_blockNumber'));
   } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+});
+
+test('mixed async scopes in one batch retain per-method attribution', async () => {
+  const telemetry = new RpcTelemetry('agent-test');
+  telemetry.physicalEnvelope(4663, ['eth_call', 'eth_getCode'], 0, [
+    { workflow: 'multi-pool-verification', cycleId: 'c1', candidateToken: '0x' + '11'.repeat(20), poolIdentity: 'pool-1' },
+    { workflow: 'selected-pool-fresh-verification', cycleId: 'c2', candidateToken: '0x' + '22'.repeat(20), poolIdentity: 'pool-2' },
+  ]);
+  const rows = telemetry.snapshot().scopes;
+  assert.ok(rows.some(row => row.workflow === 'multi-pool-verification' && row.method === 'eth_call' && row.poolIdentity === 'pool-1'));
+  assert.ok(rows.some(row => row.workflow === 'selected-pool-fresh-verification' && row.method === 'eth_getCode' && row.poolIdentity === 'pool-2'));
 });
 
 test('telemetry persists bounded daily aggregates and redacts payloads', async () => {

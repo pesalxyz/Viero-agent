@@ -22,7 +22,7 @@ export class PublicClients {
 }
 
 function instrumentedHttp(url: string, chainId: ChainId, index: number, telemetry: RpcTelemetry): Transport {
-  const pending: Array<{ methods: string[]; context: RpcScopeContext; startedAt: number }> = [];
+  const pending: Array<{ methods: string[]; contexts: RpcScopeContext[]; startedAt: number }> = [];
   const requestContexts: RpcScopeContext[] = [];
   const base = http(url, {
     timeout: 20000, retryCount: 2, retryDelay: 750, batch: true,
@@ -30,14 +30,15 @@ function instrumentedHttp(url: string, chainId: ChainId, index: number, telemetr
       const methods = rpcMethods(init.body);
       // viem's fetch callbacks run outside the caller's AsyncLocalStorage scope.
       // Pair the envelope with the contexts captured at request() time instead.
-      const context = requestContexts.shift() ?? telemetry.context();
-      pending.push({ methods, context, startedAt: Date.now() });
-      telemetry.physicalEnvelope(chainId, methods, index);
+      const contexts = requestContexts.splice(0, methods.length);
+      const context = contexts[0] ?? telemetry.context();
+      pending.push({ methods, contexts, startedAt: Date.now() });
+      telemetry.physicalEnvelope(chainId, methods, index, contexts);
       if (index > 0) telemetry.retry(chainId, methods[0] ?? 'unknown', context.workflow);
     },
     onFetchResponse: response => {
       const attempt = pending.shift();
-      if (attempt) telemetry.physicalEnvelopeResult(chainId, attempt.methods, response.ok, Date.now() - attempt.startedAt, attempt.context);
+      if (attempt) telemetry.physicalEnvelopeResult(chainId, attempt.methods, response.ok, Date.now() - attempt.startedAt, attempt.contexts);
     },
   });
   return ({ chain }) => {
